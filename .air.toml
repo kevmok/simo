@@ -1,0 +1,13 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/simo ./cmd/simo"
+  bin = "./tmp/simo"
+  delay = 1000
+  exclude_dir = ["assets", "tmp", "vendor", "build"]
+  include_ext = ["go", "tpl", "tmpl", "html"]
+  exclude_regex = ["_test.go"]
+
+[screen]
+  clear_on_rebuild = true

@@ -1,0 +1,37 @@
+version: "3"
+
+vars:
+  BINARY_NAME: myapp
+  BUILD_DIR: build
+
+tasks:
+  build:
+    desc: Build the application
+    cmds:
+      - mkdir -p {{.BUILD_DIR}}
+      - go build -o {{.BUILD_DIR}}/{{.BINARY_NAME}} ./cmd/simo
+
+  clean:
+    desc: Clean build directory
+    cmds:
+      - rm -rf {{.BUILD_DIR}}
+  dev:
+    desc: Start development server with hot reload
+    cmds:
+      - air
+
+  lint:
+    desc: Run linter
+    cmds:
+      - golangci-lint run
+
+  tidy:
+    desc: Tidy and verify dependencies
+    cmds:
+      - go mod tidy
+      - go mod verify
+
+  test:
+    desc: Run tests
+    cmds:
+      - go test -v ./...
