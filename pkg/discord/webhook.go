@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/webhook"
 	"github.com/disgoorg/snowflake/v2"
 )
@@ -48,8 +49,6 @@ func ParseWebhookURL(url string) (string, string, error) {
 
 // SendMessage implements the message sending functionality
 func (c *DiscordWebhookClient) SendMessage(content string) error {
-	_, err := c.client.CreateMessage(webhook.MessageCreate{
-		Content: content,
-	})
+	_, err := c.client.CreateMessage(discord.NewWebhookMessageCreateBuilder().SetContent(content).Build())
 	return err
 }

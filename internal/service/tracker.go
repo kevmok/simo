@@ -4,7 +4,12 @@ import (
 	"context"
 	"fmt"
 	"simo/internal/config"
+	"simo/internal/repository"
+	"simo/internal/service/parser"
+	"simo/internal/service/websocket"
 	"simo/pkg/discord"
+	"simo/pkg/solanatracker"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
@@ -12,19 +17,27 @@ import (
 
 type WalletTrackerService interface {
 	Close()
-	// Add other methods here as we implement them
-	NotifyTransaction(tx *Transaction) error
+	AddWallet(ctx context.Context, address string) error
+	GetWalletPositions(ctx context.Context, address string) ([]repository.TokenPosition, error)
+	GetWalletProfitLoss(ctx context.Context, address string) (map[string]*repository.ProfitLoss, error)
+	ProcessTransaction(ctx context.Context, tx *repository.Transaction) error
 }
 
 type WalletTracker struct {
-	db      *pgxpool.Pool
-	discord discord.WebhookClient
-	logger  zerolog.Logger
+	db         *pgxpool.Pool
+	repo       repository.Repository
+	discord    discord.WebhookClient
+	wsClient   *websocket.Client
+	solTracker *solanatracker.Client
+	parser     *parser.TransactionParser
+	logger     zerolog.Logger
 }
 
 type Config struct {
-	WebhookURL   string
-	SolanaRPCURL string
+	WebhookURL         string
+	SolanaRPCURL       string
+	SolanaWebSocketURL string
+	SolanaTrackerKey   string
 }
 
 func NewWalletTracker(ctx context.Context, cfg Config, logger zerolog.Logger) (*WalletTracker, error) {
@@ -34,6 +47,8 @@ func NewWalletTracker(ctx context.Context, cfg Config, logger zerolog.Logger) (*
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
+	repo := repository.NewRepository(dbPool)
+
 	// Parse and initialize Discord webhook
 	webhookID, webhookToken, err := discord.ParseWebhookURL(cfg.WebhookURL)
 	if err != nil {
@@ -45,23 +60,302 @@ func NewWalletTracker(ctx context.Context, cfg Config, logger zerolog.Logger) (*
 		return nil, fmt.Errorf("error creating webhook client: %w", err)
 	}
 
-	return &WalletTracker{
-		db:      dbPool,
-		discord: webhookClient,
-		logger:  logger,
-	}, nil
+	wsClient, err := websocket.NewClient(cfg.SolanaWebSocketURL, logger, cfg.SolanaRPCURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create WebSocket client: %w", err)
+	}
+
+	solTracker, err := solanatracker.NewClient(solanatracker.ClientConfig{
+		APIKey: cfg.SolanaTrackerKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SolanaTracker client: %w", err)
+	}
+
+	tracker := &WalletTracker{
+		db:         dbPool,
+		repo:       repo,
+		discord:    webhookClient,
+		wsClient:   wsClient,
+		solTracker: solTracker,
+		logger:     logger,
+		parser:     parser.NewTransactionParser(cfg.SolanaRPCURL, logger),
+	}
+	// Start tracking existing wallets
+	if err := tracker.initializeWalletTracking(ctx); err != nil {
+		return nil, fmt.Errorf("failed to initialize wallet tracking: %w", err)
+	}
+
+	return tracker, nil
 }
 
 func (wt *WalletTracker) Close() {
+	if wt.wsClient != nil {
+		wt.wsClient.Close()
+	}
 	if wt.db != nil {
 		wt.db.Close()
 	}
 }
 
-// Example method to send notification
-func (wt *WalletTracker) NotifyTransaction(tx *Transaction) error {
-	message := fmt.Sprintf("New transaction detected!\nWallet: %s\nAmount: %f\nType: %s",
-		tx.WalletAddress, tx.Amount, tx.Type)
+func (wt *WalletTracker) AddWallet(ctx context.Context, address string) error {
+	if err := wt.repo.AddWallet(ctx, address); err != nil {
+		return fmt.Errorf("failed to add wallet to database: %w", err)
+	}
+
+	if err := wt.startTrackingWallet(ctx, address); err != nil {
+		return fmt.Errorf("failed to start tracking wallet: %w", err)
+	}
+
+	return nil
+}
+
+func (wt *WalletTracker) GetWalletPositions(ctx context.Context, address string) ([]repository.TokenPosition, error) {
+	wallet, err := wt.repo.GetWalletByAddress(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+	return wt.repo.GetTokenPositions(ctx, wallet.ID)
+}
+
+func (wt *WalletTracker) initializeWalletTracking(ctx context.Context) error {
+	wallets, err := wt.repo.GetWallets(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get wallets: %w", err)
+	}
+
+	for _, wallet := range wallets {
+		if err := wt.startTrackingWallet(ctx, wallet.Address); err != nil {
+			wt.logger.Error().
+				Err(err).
+				Str("wallet", wallet.Address).
+				Msg("Failed to start tracking wallet")
+		}
+	}
+
+	return nil
+}
+func (wt *WalletTracker) startTrackingWallet(ctx context.Context, address string) error {
+	wt.logger.Info().
+		Str("wallet", address).
+		Msg("Starting to track wallet")
+
+	return wt.wsClient.SubscribeToWallet(ctx, address, func(signature string) {
+		wt.logger.Info().
+			Str("wallet", address).
+			Str("signature", signature).
+			Msg("Received transaction notification")
+
+		// Process transaction in a separate goroutine
+		go func() {
+			if err := wt.handleTransaction(ctx, address, signature); err != nil {
+				wt.logger.Error().
+					Err(err).
+					Str("wallet", address).
+					Str("signature", signature).
+					Msg("Failed to handle transaction")
+			}
+		}()
+	})
+}
+
+func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, signature string) error {
+	// Parse the transaction
+	tokenTx, err := wt.parser.ParseTransaction(ctx, signature, walletAddress)
+	if err != nil {
+		return fmt.Errorf("failed to parse transaction: %w", err)
+	}
+
+	// If it's not a token transaction we care about, ignore it
+	if tokenTx == nil {
+		return nil
+	}
+
+	// Get wallet ID for database operations
+	wallet, err := wt.repo.GetWalletByAddress(ctx, walletAddress)
+	if err != nil {
+		return fmt.Errorf("failed to get wallet: %w", err)
+	}
+
+	tx := &repository.Transaction{
+		WalletID:  wallet.ID,
+		TokenIn:   tokenTx.TokenIn,
+		TokenOut:  tokenTx.TokenOut,
+		AmountIn:  tokenTx.AmountIn,
+		AmountOut: tokenTx.AmountOut,
+		Program:   tokenTx.Program,
+		Signature: tokenTx.Signature,
+		Timestamp: time.Now(),
+	}
+
+	if err := wt.repo.AddTransaction(ctx, tx); err != nil {
+		return fmt.Errorf("failed to record transaction: %w", err)
+	}
+
+	// Get token information for both tokens
+	tokenInInfo, err := wt.solTracker.GetTokenInfo(ctx, tokenTx.TokenIn)
+	if err != nil {
+		wt.logger.Warn().Err(err).Str("token", tokenTx.TokenIn).Msg("Failed to get token info")
+	}
+
+	tokenOutInfo, err := wt.solTracker.GetTokenInfo(ctx, tokenTx.TokenOut)
+	if err != nil {
+		wt.logger.Warn().Err(err).Str("token", tokenTx.TokenOut).Msg("Failed to get token info")
+	}
+
+	// log token in info and out info
+	wt.logger.Info().
+		Str("tokenIn", tokenInInfo.Token.Name).
+		Str("tokenInSymbol", tokenInInfo.Token.Symbol).
+		Str("tokenOut", tokenOutInfo.Token.Name).
+		Str("tokenOutSymbol", tokenOutInfo.Token.Symbol).
+		Msg("Token info retrieved")
+	// Format and send Discord notification
+	message := fmt.Sprintf("🔄 Swap Detected!\n"+
+		"From: %s (%s)\n"+
+		"To: %s (%s)\n"+
+		"Amount Out: %.4f %s\n"+
+		"Amount In: %.4f %s\n"+
+		"DEX: %s",
+		tokenInInfo.Token.Name, tokenInInfo.Token.Symbol,
+		tokenOutInfo.Token.Name, tokenOutInfo.Token.Symbol,
+		tokenTx.AmountOut, tokenOutInfo.Token.Symbol,
+		tokenTx.AmountIn, tokenInInfo.Token.Symbol,
+		tokenTx.Program,
+	)
 
 	return wt.discord.SendMessage(message)
 }
+
+// func (wt *WalletTracker) handleBuyTransaction(ctx context.Context, tx *repository.Transaction) error {
+// 	// Get token info from SolanaTracker
+// 	tokenInfo, err := wt.solTracker.GetTokenInfo(ctx, tx.TokenAddress)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to get token info: %w", err)
+// 	}
+
+// 	// Update transaction with current price
+// 	if len(tokenInfo.Pools) > 0 {
+// 		tx.PricePerToken = tokenInfo.Pools[0].Price.USD
+// 	}
+
+// 	// Record the transaction
+// 	if err := wt.repo.AddTransaction(ctx, tx); err != nil {
+// 		return fmt.Errorf("failed to record transaction: %w", err)
+// 	}
+
+// 	// Update position
+// 	position, err := wt.updatePosition(ctx, tx)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to update position: %w", err)
+// 	}
+
+// 	// Format and send Discord notification
+// 	message := fmt.Sprintf("🟢 Buy Detected!\n"+
+// 		"Token: %s (%s)\n"+
+// 		"Amount: %.4f\n"+
+// 		"Price: $%.2f\n"+
+// 		"1h Change: %.2f%%\n"+
+// 		"Risk Score: %d\n"+
+// 		"Total Position: %.4f",
+// 		tokenInfo.Token.Name,
+// 		tokenInfo.Token.Symbol,
+// 		tx.Amount,
+// 		tx.PricePerToken,
+// 		tokenInfo.Events.OneHour.PriceChangePercentage,
+// 		tokenInfo.Risk.Score,
+// 		position.CurrentAmount,
+// 	)
+
+// 	if tokenInfo.Risk.Score > 5 {
+// 		message += "\n⚠️ High Risk Token!"
+// 	}
+
+// 	return wt.discord.SendMessage(message)
+// }
+
+// func (wt *WalletTracker) handleSellTransaction(ctx context.Context, tx *repository.Transaction) error {
+// 	// Get PnL from SolanaTracker
+// 	pnl, err := wt.solTracker.GetProfitLoss(ctx, tx.TokenAddress, strconv.Itoa(tx.WalletID))
+// 	if err != nil {
+// 		return fmt.Errorf("failed to get PnL: %w", err)
+// 	}
+
+// 	// Update transaction with current price
+// 	tx.PricePerToken = pnl.CurrentValue / pnl.Holding // Calculate price from PnL data
+
+// 	// Record the transaction
+// 	if err := wt.repo.AddTransaction(ctx, tx); err != nil {
+// 		return fmt.Errorf("failed to record transaction: %w", err)
+// 	}
+
+// 	// Update position
+// 	// position, err := wt.updatePosition(ctx, tx)
+// 	// if err != nil {
+// 	// 	return fmt.Errorf("failed to update position: %w", err)
+// 	// }
+
+// 	// Format and send Discord notification
+// 	message := fmt.Sprintf("🔴 Sell Detected!\n"+
+// 		"Token: %s\n"+
+// 		"Amount: %.4f\n"+
+// 		"Price: $%.2f\n"+
+// 		"Realized PnL: $%.2f\n"+
+// 		"Total PnL: $%.2f\n"+
+// 		// "Remaining Position: %.4f",
+// 		tx.TokenAddress,
+// 		tx.Amount,
+// 		tx.PricePerToken,
+// 		pnl.Realized,
+// 		pnl.Total,
+// 		// position.CurrentAmount,
+// 	)
+
+//		return wt.discord.SendMessage(message)
+//	}
+// func (wt *WalletTracker) updatePosition(ctx context.Context, tx *repository.Transaction) (*repository.TokenPosition, error) {
+// 	positions, err := wt.repo.GetTokenPositions(ctx, tx.WalletID)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to get token positions: %w", err)
+// 	}
+
+// 	var currentPosition *repository.TokenPosition
+// 	for _, pos := range positions {
+// 		if pos.TokenAddress == tx.TokenAddress {
+// 			currentPosition = &pos
+// 			break
+// 		}
+// 	}
+
+// 	if currentPosition == nil {
+// 		currentPosition = &repository.TokenPosition{
+// 			WalletID:        tx.WalletID,
+// 			TokenAddress:    tx.TokenAddress,
+// 			CurrentAmount:   0,
+// 			AvgEntryPrice:   0,
+// 			FirstPurchaseAt: tx.Timestamp,
+// 		}
+// 	}
+
+// 	if tx.Type == "buy" {
+// 		totalValue := (currentPosition.CurrentAmount * currentPosition.AvgEntryPrice) +
+// 			(tx.Amount * tx.PricePerToken)
+// 		newAmount := currentPosition.CurrentAmount + tx.Amount
+// 		currentPosition.AvgEntryPrice = totalValue / newAmount
+// 		currentPosition.CurrentAmount = newAmount
+// 	} else {
+// 		currentPosition.CurrentAmount -= tx.Amount
+// 	}
+
+// 	if currentPosition.CurrentAmount > 0 {
+// 		if err := wt.repo.UpdateTokenPosition(ctx, currentPosition); err != nil {
+// 			return nil, fmt.Errorf("failed to update token position: %w", err)
+// 		}
+// 	} else {
+// 		if err := wt.repo.RemoveTokenPosition(ctx, tx.WalletID, tx.TokenAddress); err != nil {
+// 			return nil, fmt.Errorf("failed to remove token position: %w", err)
+// 		}
+// 	}
+
+// 	return currentPosition, nil
+// }

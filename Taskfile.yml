@@ -18,6 +18,7 @@ tasks:
   dev:
     desc: Start development server with hot reload
     cmds:
+      - rm -rf {{.BUILD_DIR}}
       - air
 
   lint:
