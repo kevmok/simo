@@ -14,9 +14,17 @@ import (
 
 func main() {
 	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Fatal().Err(err).Msg("Error loading .env file")
-	}
+	if _, err := os.Stat(".env"); err == nil {
+		err := godotenv.Load()
+		if err != nil {
+			log.Fatal().Msg("Error loading .env file")
+		}
+		log.Info().Msg("Loaded .env file")
+	} else if os.IsNotExist(err) {
+		log.Info().Msg("No .env file found, continuing with default environment")
+	} else {
+		log.Info().Msgf("Error checking .env file: %v", err)
+	t
 
 	// Initialize logger
 	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
