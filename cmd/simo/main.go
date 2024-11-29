@@ -24,7 +24,6 @@ func main() {
 		log.Info().Msg("No .env file found, continuing with default environment")
 	} else {
 		log.Info().Msgf("Error checking .env file: %v", err)
-		t
 
 		// Initialize logger
 		logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
