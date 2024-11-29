@@ -4,8 +4,11 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"simo/internal/handler"
+	"simo/internal/server"
 	"simo/internal/service"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
@@ -49,9 +52,24 @@ func main() {
 	}
 	defer tracker.Close()
 
+	// Initialize handler and server
+	h := handler.NewHandler(tracker, logger)
+	srv := server.NewServer(server.Config{
+		Port:            "8080",
+		ShutdownTimeout: 30 * time.Second,
+	}, h, logger)
+
 	// Set up signal handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Start the server in a goroutine
+	go func() {
+		if err := srv.Start(); err != nil {
+			logger.Error().Err(err).Msg("Server error")
+			cancel() // Cancel main context if server fails
+		}
+	}()
 
 	// Wait for either a signal or context cancellation
 	select {
@@ -59,6 +77,13 @@ func main() {
 		logger.Info().
 			Str("signal", sig.String()).
 			Msg("Received shutdown signal")
+			// Shutdown with timeout
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logger.Error().Err(err).Msg("Server shutdown failed")
+		}
 	case <-ctx.Done():
 		logger.Info().Msg("Context canceled")
 	}

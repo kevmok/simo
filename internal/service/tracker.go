@@ -19,9 +19,10 @@ import (
 type WalletTrackerService interface {
 	Close()
 	AddWallet(ctx context.Context, address string) error
-	GetWalletPositions(ctx context.Context, address string) ([]repository.TokenPosition, error)
-	GetWalletProfitLoss(ctx context.Context, address string) (map[string]*repository.ProfitLoss, error)
-	ProcessTransaction(ctx context.Context, tx *repository.Transaction) error
+	RemoveWallet(ctx context.Context, address string) error
+	GetWallets(ctx context.Context) ([]repository.Wallet, error)
+
+	handleTransaction(ctx context.Context, walletAddress, signature string) error
 }
 
 type WalletTracker struct {
@@ -125,6 +126,24 @@ func (wt *WalletTracker) AddWallet(ctx context.Context, address string) error {
 	}
 
 	return nil
+}
+
+func (wt *WalletTracker) RemoveWallet(ctx context.Context, address string) error {
+	// First stop tracking the wallet
+	if err := wt.wsClient.UnsubscribeFromWallet(ctx, address); err != nil {
+		return fmt.Errorf("failed to unsubscribe from wallet: %w", err)
+	}
+
+	// Then remove from database
+	if err := wt.repo.RemoveWallet(ctx, address); err != nil {
+		return fmt.Errorf("failed to remove wallet from database: %w", err)
+	}
+
+	return nil
+}
+
+func (wt *WalletTracker) GetWallets(ctx context.Context) ([]repository.Wallet, error) {
+	return wt.repo.GetWallets(ctx)
 }
 
 func (wt *WalletTracker) GetWalletPositions(ctx context.Context, address string) ([]repository.TokenPosition, error) {

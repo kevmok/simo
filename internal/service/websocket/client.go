@@ -165,6 +165,18 @@ func (c *Client) SubscribeToWallet(ctx context.Context, walletAddress string, ca
 	return nil
 }
 
+func (c *Client) UnsubscribeFromWallet(ctx context.Context, address string) error {
+	if sub, ok := c.subscriptions.LoadAndDelete(address + "_logs"); ok {
+		if logsSub, ok := sub.(*ws.LogSubscription); ok {
+			logsSub.Unsubscribe()
+			c.logger.Info().
+				Str("wallet", address).
+				Msg("Unsubscribed from wallet logs")
+		}
+	}
+	return nil
+}
+
 func (c *Client) monitorWallet(ctx context.Context, walletAddress string, sub *ws.LogSubscription, callback func(string)) {
 	defer sub.Unsubscribe()
 
@@ -264,16 +276,6 @@ func (c *Client) monitorWallet(ctx context.Context, walletAddress string, sub *w
 	}
 }
 
-func (c *Client) UnsubscribeFromWallet(walletAddress string) {
-	if sub, ok := c.subscriptions.LoadAndDelete(walletAddress); ok {
-		if subscription, ok := sub.(*ws.AccountSubscription); ok {
-			subscription.Unsubscribe()
-			c.logger.Info().
-				Str("wallet", walletAddress).
-				Msg("Unsubscribed from wallet")
-		}
-	}
-}
 func (c *Client) monitorProgram(ctx context.Context, walletAddress string, sub *ws.LogSubscription, callback func(string)) {
 
 	defer sub.Unsubscribe()
