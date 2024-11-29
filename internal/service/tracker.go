@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
+	"github.com/sourcegraph/conc"
 )
 
 type WalletTrackerService interface {
@@ -26,7 +27,7 @@ type WalletTrackerService interface {
 type WalletTracker struct {
 	db         *pgxpool.Pool
 	repo       repository.Repository
-	discord    discord.WebhookClient
+	discords   map[string]discord.WebhookClient
 	wsClient   *websocket.Client
 	solTracker *solanatracker.Client
 	parser     *parser.TransactionParser
@@ -49,17 +50,6 @@ func NewWalletTracker(ctx context.Context, cfg Config, logger zerolog.Logger) (*
 	}
 	repo := repository.NewRepository(dbPool)
 
-	// Parse and initialize Discord webhook
-	webhookID, webhookToken, err := discord.ParseWebhookURL(cfg.WebhookURL)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing webhook URL: %w", err)
-	}
-
-	webhookClient, err := discord.NewWebhookClient(webhookID, webhookToken)
-	if err != nil {
-		return nil, fmt.Errorf("error creating webhook client: %w", err)
-	}
-
 	wsClient, err := websocket.NewClient(cfg.SolanaWebSocketURL, logger, cfg.SolanaRPCURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create WebSocket client: %w", err)
@@ -72,10 +62,37 @@ func NewWalletTracker(ctx context.Context, cfg Config, logger zerolog.Logger) (*
 		return nil, fmt.Errorf("failed to create SolanaTracker client: %w", err)
 	}
 
+	webhooks, err := repo.GetWebhooks(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get webhooks: %w", err)
+	}
+
+	discords := make(map[string]discord.WebhookClient)
+	for _, webhook := range webhooks {
+		webhookID, webhookToken, err := discord.ParseWebhookURL(webhook.WebhookURL)
+		if err != nil {
+			logger.Error().
+				Err(err).
+				Str("webhook_name", webhook.Name).
+				Msg("Failed to parse webhook URL")
+			continue
+		}
+
+		client, err := discord.NewWebhookClient(webhookID, webhookToken)
+		if err != nil {
+			logger.Error().
+				Err(err).
+				Str("webhook_name", webhook.Name).
+				Msg("Failed to create webhook client")
+			continue
+		}
+		discords[webhook.Name] = client
+	}
+
 	tracker := &WalletTracker{
 		db:         dbPool,
 		repo:       repo,
-		discord:    webhookClient,
+		discords:   discords,
 		wsClient:   wsClient,
 		solTracker: solTracker,
 		logger:     logger,
@@ -211,151 +228,46 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 		Str("tokenOutSymbol", tokenOutInfo.Token.Symbol).
 		Msg("Token info retrieved")
 	// Format and send Discord notification
-	message := fmt.Sprintf("🔄 Swap Detected!\n"+
-		"From: %s (%s)\n"+
-		"To: %s (%s)\n"+
-		"Amount Out: %.4f %s\n"+
-		"Amount In: %.4f %s\n"+
-		"DEX: %s",
-		tokenInInfo.Token.Name, tokenInInfo.Token.Symbol,
-		tokenOutInfo.Token.Name, tokenOutInfo.Token.Symbol,
-		tokenTx.AmountOut, tokenOutInfo.Token.Symbol,
+	message := fmt.Sprintf("🔄 **Swap Detected** ‼️\n\n"+
+		"**Tracked Wallet**: %s\n\n"+
+		"**Swapped From**: %s (%s) - %s\n"+
+		"**For**: %s (%s) - %s\n"+
+		"**Swapped**: %.6f %s\n"+
+		"**For**: %.6f %s\n"+
+		"**On DEX**: %s\n\n"+
+		"**[SolscanTransaction](https://solscan.io/tx/%s)**",
+		wallet.Address,
+		tokenInInfo.Token.Name, tokenInInfo.Token.Symbol, tokenTx.TokenIn,
+		tokenOutInfo.Token.Name, tokenOutInfo.Token.Symbol, tokenTx.TokenOut,
 		tokenTx.AmountIn, tokenInInfo.Token.Symbol,
+		tokenTx.AmountOut, tokenOutInfo.Token.Symbol,
 		tokenTx.Program,
+		tokenTx.Signature,
 	)
 
-	return wt.discord.SendMessage(message)
+	return wt.sendMessageToAllWebhooks(message)
 }
 
-// func (wt *WalletTracker) handleBuyTransaction(ctx context.Context, tx *repository.Transaction) error {
-// 	// Get token info from SolanaTracker
-// 	tokenInfo, err := wt.solTracker.GetTokenInfo(ctx, tx.TokenAddress)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to get token info: %w", err)
-// 	}
+func (wt *WalletTracker) sendMessageToAllWebhooks(message string) error {
+	var wg conc.WaitGroup
+	defer wg.Wait()
+	var errs []error
 
-// 	// Update transaction with current price
-// 	if len(tokenInfo.Pools) > 0 {
-// 		tx.PricePerToken = tokenInfo.Pools[0].Price.USD
-// 	}
+	for name, client := range wt.discords {
+		name, client := name, client // Create new variables for goroutine
+		wg.Go(func() {
+			if err := client.SendMessage(message); err != nil {
+				wt.logger.Error().
+					Err(err).
+					Str("webhook_name", name).
+					Msg("Failed to send message to webhook")
+				errs = append(errs, err)
+			}
+		})
+	}
 
-// 	// Record the transaction
-// 	if err := wt.repo.AddTransaction(ctx, tx); err != nil {
-// 		return fmt.Errorf("failed to record transaction: %w", err)
-// 	}
-
-// 	// Update position
-// 	position, err := wt.updatePosition(ctx, tx)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to update position: %w", err)
-// 	}
-
-// 	// Format and send Discord notification
-// 	message := fmt.Sprintf("🟢 Buy Detected!\n"+
-// 		"Token: %s (%s)\n"+
-// 		"Amount: %.4f\n"+
-// 		"Price: $%.2f\n"+
-// 		"1h Change: %.2f%%\n"+
-// 		"Risk Score: %d\n"+
-// 		"Total Position: %.4f",
-// 		tokenInfo.Token.Name,
-// 		tokenInfo.Token.Symbol,
-// 		tx.Amount,
-// 		tx.PricePerToken,
-// 		tokenInfo.Events.OneHour.PriceChangePercentage,
-// 		tokenInfo.Risk.Score,
-// 		position.CurrentAmount,
-// 	)
-
-// 	if tokenInfo.Risk.Score > 5 {
-// 		message += "\n⚠️ High Risk Token!"
-// 	}
-
-// 	return wt.discord.SendMessage(message)
-// }
-
-// func (wt *WalletTracker) handleSellTransaction(ctx context.Context, tx *repository.Transaction) error {
-// 	// Get PnL from SolanaTracker
-// 	pnl, err := wt.solTracker.GetProfitLoss(ctx, tx.TokenAddress, strconv.Itoa(tx.WalletID))
-// 	if err != nil {
-// 		return fmt.Errorf("failed to get PnL: %w", err)
-// 	}
-
-// 	// Update transaction with current price
-// 	tx.PricePerToken = pnl.CurrentValue / pnl.Holding // Calculate price from PnL data
-
-// 	// Record the transaction
-// 	if err := wt.repo.AddTransaction(ctx, tx); err != nil {
-// 		return fmt.Errorf("failed to record transaction: %w", err)
-// 	}
-
-// 	// Update position
-// 	// position, err := wt.updatePosition(ctx, tx)
-// 	// if err != nil {
-// 	// 	return fmt.Errorf("failed to update position: %w", err)
-// 	// }
-
-// 	// Format and send Discord notification
-// 	message := fmt.Sprintf("🔴 Sell Detected!\n"+
-// 		"Token: %s\n"+
-// 		"Amount: %.4f\n"+
-// 		"Price: $%.2f\n"+
-// 		"Realized PnL: $%.2f\n"+
-// 		"Total PnL: $%.2f\n"+
-// 		// "Remaining Position: %.4f",
-// 		tx.TokenAddress,
-// 		tx.Amount,
-// 		tx.PricePerToken,
-// 		pnl.Realized,
-// 		pnl.Total,
-// 		// position.CurrentAmount,
-// 	)
-
-//		return wt.discord.SendMessage(message)
-//	}
-// func (wt *WalletTracker) updatePosition(ctx context.Context, tx *repository.Transaction) (*repository.TokenPosition, error) {
-// 	positions, err := wt.repo.GetTokenPositions(ctx, tx.WalletID)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to get token positions: %w", err)
-// 	}
-
-// 	var currentPosition *repository.TokenPosition
-// 	for _, pos := range positions {
-// 		if pos.TokenAddress == tx.TokenAddress {
-// 			currentPosition = &pos
-// 			break
-// 		}
-// 	}
-
-// 	if currentPosition == nil {
-// 		currentPosition = &repository.TokenPosition{
-// 			WalletID:        tx.WalletID,
-// 			TokenAddress:    tx.TokenAddress,
-// 			CurrentAmount:   0,
-// 			AvgEntryPrice:   0,
-// 			FirstPurchaseAt: tx.Timestamp,
-// 		}
-// 	}
-
-// 	if tx.Type == "buy" {
-// 		totalValue := (currentPosition.CurrentAmount * currentPosition.AvgEntryPrice) +
-// 			(tx.Amount * tx.PricePerToken)
-// 		newAmount := currentPosition.CurrentAmount + tx.Amount
-// 		currentPosition.AvgEntryPrice = totalValue / newAmount
-// 		currentPosition.CurrentAmount = newAmount
-// 	} else {
-// 		currentPosition.CurrentAmount -= tx.Amount
-// 	}
-
-// 	if currentPosition.CurrentAmount > 0 {
-// 		if err := wt.repo.UpdateTokenPosition(ctx, currentPosition); err != nil {
-// 			return nil, fmt.Errorf("failed to update token position: %w", err)
-// 		}
-// 	} else {
-// 		if err := wt.repo.RemoveTokenPosition(ctx, tx.WalletID, tx.TokenAddress); err != nil {
-// 			return nil, fmt.Errorf("failed to remove token position: %w", err)
-// 		}
-// 	}
-
-// 	return currentPosition, nil
-// }
+	if len(errs) > 0 {
+		return fmt.Errorf("failed to send message to some webhooks: %v", errs)
+	}
+	return nil
+}

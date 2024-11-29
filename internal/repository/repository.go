@@ -45,6 +45,14 @@ type Transaction struct {
 	Timestamp time.Time `db:"timestamp"`
 }
 
+type Webhook struct {
+	ID         int       `db:"id"`
+	Name       string    `db:"name"`
+	WebhookURL string    `db:"webhook_url"`
+	CreatedAt  time.Time `db:"created_at"`
+	UpdatedAt  time.Time `db:"updated_at"`
+}
+
 type Repository interface {
 	// Wallet operations
 	AddWallet(ctx context.Context, address string) error
@@ -60,6 +68,11 @@ type Repository interface {
 	// Transaction operations
 	AddTransaction(ctx context.Context, tx *Transaction) error
 	GetTransactions(ctx context.Context, walletID int, tokenAddress string) ([]Transaction, error)
+
+	// Webhook operations
+	GetWebhooks(ctx context.Context) ([]Webhook, error)
+	AddWebhook(ctx context.Context, name, url string) error
+	RemoveWebhook(ctx context.Context, id int) error
 }
 
 type PostgresRepository struct {
@@ -206,4 +219,32 @@ func (r *PostgresRepository) GetTransactions(ctx context.Context, walletID int, 
 		return nil, err
 	}
 	return transactions, nil
+}
+
+// Implement the new methods
+func (r *PostgresRepository) GetWebhooks(ctx context.Context) ([]Webhook, error) {
+	var webhooks []Webhook
+	query := `SELECT * FROM webhooks ORDER BY created_at DESC`
+	if err := pgxscan.Select(ctx, r.db, &webhooks, query); err != nil {
+		return nil, err
+	}
+	return webhooks, nil
+}
+
+func (r *PostgresRepository) AddWebhook(ctx context.Context, name, url string) error {
+	query := `
+        INSERT INTO webhooks (name, webhook_url)
+        VALUES ($1, $2)
+        ON CONFLICT (name) DO UPDATE SET
+        webhook_url = EXCLUDED.webhook_url,
+        updated_at = NOW()`
+
+	_, err := r.db.Exec(ctx, query, name, url)
+	return err
+}
+
+func (r *PostgresRepository) RemoveWebhook(ctx context.Context, id int) error {
+	query := `DELETE FROM webhooks WHERE id = $1`
+	_, err := r.db.Exec(ctx, query, id)
+	return err
 }

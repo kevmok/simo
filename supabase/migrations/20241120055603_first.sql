@@ -32,7 +32,16 @@ CREATE TABLE transactions (
     timestamp TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE webhooks (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    webhook_url TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- Create indexes for better query performance
 CREATE INDEX idx_wallets_address ON wallets(address);
 CREATE INDEX idx_transactions_wallet_token ON transactions(wallet_id, token_in);
 CREATE INDEX idx_token_positions_wallet ON token_positions(wallet_id);
+CREATE INDEX idx_webhooks_name ON webhooks(name);
