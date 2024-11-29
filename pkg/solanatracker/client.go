@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -86,12 +87,23 @@ type ProfitLoss struct {
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
+	// Validate and sanitize API key
+	apiKey := strings.TrimSpace(config.APIKey)
+	if apiKey == "" {
+		return nil, fmt.Errorf("empty API key provided")
+	}
+
+	// Check for invalid characters
+	if strings.ContainsAny(apiKey, "\n\r\t") {
+		return nil, fmt.Errorf("API key contains invalid characters")
+	}
+
 	return &Client{
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
 		baseURL: baseURL,
-		apiKey:  config.APIKey,
+		apiKey:  apiKey,
 	}, nil
 }
 
@@ -102,6 +114,18 @@ func (c *Client) GetTokenInfo(ctx context.Context, tokenAddress string) (*TokenI
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
+	// Add API key to header with additional validation
+	if c.apiKey == "" {
+		return nil, fmt.Errorf("API key not set")
+	}
+
+	// Log the API key length and first/last few characters for debugging
+	keyLength := len(c.apiKey)
+	truncatedKey := ""
+	if keyLength > 8 {
+		truncatedKey = c.apiKey[:4] + "..." + c.apiKey[keyLength-4:]
+	}
+	fmt.Printf("Using API key (length: %d): %s\n", keyLength, truncatedKey)
 
 	// Add API key to header
 	req.Header.Set("x-api-key", c.apiKey)
