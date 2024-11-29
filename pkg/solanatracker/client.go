@@ -10,7 +10,9 @@ import (
 )
 
 const (
-	baseURL = "https://data.solanatracker.io"
+	baseURL        = "https://data.solanatracker.io"
+	defaultTimeout = 30 * time.Second
+	maxRetries     = 3
 )
 
 type Client struct {
@@ -100,7 +102,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 
 	return &Client{
 		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: defaultTimeout,
 		},
 		baseURL: baseURL,
 		apiKey:  apiKey,
@@ -119,18 +121,10 @@ func (c *Client) GetTokenInfo(ctx context.Context, tokenAddress string) (*TokenI
 		return nil, fmt.Errorf("API key not set")
 	}
 
-	// Log the API key length and first/last few characters for debugging
-	keyLength := len(c.apiKey)
-	truncatedKey := ""
-	if keyLength > 8 {
-		truncatedKey = c.apiKey[:4] + "..." + c.apiKey[keyLength-4:]
-	}
-	fmt.Printf("Using API key (length: %d): %s\n", keyLength, truncatedKey)
-
 	// Add API key to header
 	req.Header.Set("x-api-key", c.apiKey)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doRequestWithRetry(req)
 	if err != nil {
 		return nil, fmt.Errorf("executing request: %w", err)
 	}
@@ -172,4 +166,37 @@ func (c *Client) GetProfitLoss(ctx context.Context, walletAddress, tokenAddress 
 	}
 
 	return &pnl, nil
+}
+
+func (c *Client) doRequestWithRetry(req *http.Request) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 1s, 2s, 4s
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+			time.Sleep(backoff)
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Don't retry on specific status codes
+		if resp.StatusCode == http.StatusUnauthorized ||
+			resp.StatusCode == http.StatusForbidden ||
+			resp.StatusCode == http.StatusNotFound {
+			return resp, nil
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+
+		resp.Body.Close()
+		lastErr = fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	return nil, fmt.Errorf("all retry attempts failed: %w", lastErr)
 }
