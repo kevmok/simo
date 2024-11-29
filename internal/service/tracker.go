@@ -228,21 +228,28 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 		Str("tokenOutSymbol", tokenOutInfo.Token.Symbol).
 		Msg("Token info retrieved")
 	// Format and send Discord notification
-	message := fmt.Sprintf("🔄 **Swap Detected** ‼️\n\n"+
-		"**Tracked Wallet**: %s\n\n"+
-		"**Swapped From**: %s (%s) - %s\n"+
-		"**For**: %s (%s) - %s\n"+
-		"**Swapped**: %.6f %s\n"+
-		"**For**: %.6f %s\n"+
-		"**On DEX**: %s\n\n"+
-		"**[SolscanTransaction](https://solscan.io/tx/%s)**",
-		wallet.Address,
-		tokenInInfo.Token.Name, tokenInInfo.Token.Symbol, tokenTx.TokenIn,
-		tokenOutInfo.Token.Name, tokenOutInfo.Token.Symbol, tokenTx.TokenOut,
+	message := fmt.Sprintf("# 💱 New Swap Alert\n"+
+		"### [View Wallet](https://solana.fm/address/%s) | [View Transaction](https://solscan.io/tx/%s)\n\n"+
+		"**From Token**\n"+
+		"> %s (%s)\n"+
+		"> Amount: `%.6f %s`\n"+
+		"> Address: `%s`\n\n"+
+		"**To Token**\n"+
+		"> %s (%s)\n"+
+		"> Amount: `%.6f %s`\n"+
+		"> Address: `%s`\n\n"+
+		"**Details**\n"+
+		"> 🏦 DEX: `%s`\n"+
+		"> 👛 Wallet: `%s`",
+		wallet.Address, tokenTx.Signature,
+		tokenInInfo.Token.Name, tokenInInfo.Token.Symbol,
 		tokenTx.AmountIn, tokenInInfo.Token.Symbol,
+		tokenTx.TokenIn,
+		tokenOutInfo.Token.Name, tokenOutInfo.Token.Symbol,
 		tokenTx.AmountOut, tokenOutInfo.Token.Symbol,
+		tokenTx.TokenOut,
 		tokenTx.Program,
-		tokenTx.Signature,
+		wallet.Address,
 	)
 
 	return wt.sendMessageToAllWebhooks(message)
