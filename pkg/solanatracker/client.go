@@ -5,14 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	baseURL        = "https://data.solanatracker.io"
-	defaultTimeout = 30 * time.Second
-	maxRetries     = 3
+	baseURL           = "https://data.solanatracker.io"
+	defaultTimeout    = 30 * time.Second
+	maxRetries        = 3
+	defaultRetryDelay = 5 * time.Second
 )
 
 type Client struct {
@@ -183,20 +185,62 @@ func (c *Client) doRequestWithRetry(req *http.Request) (*http.Response, error) {
 			continue
 		}
 
-		// Don't retry on specific status codes
-		if resp.StatusCode == http.StatusUnauthorized ||
-			resp.StatusCode == http.StatusForbidden ||
-			resp.StatusCode == http.StatusNotFound {
+		// Handle different status codes
+		switch resp.StatusCode {
+		case http.StatusOK:
 			return resp, nil
-		}
+		case http.StatusTooManyRequests:
+			// Get retry delay from response headers
+			delay := getRetryDelay(resp)
+			resp.Body.Close()
 
-		if resp.StatusCode == http.StatusOK {
+			// Check if we have retries left
+			if attempt == maxRetries {
+				return nil, fmt.Errorf("rate limit exceeded and out of retries")
+			}
+
+			// Log rate limit hit (you can modify this based on your logging setup)
+			fmt.Printf("Rate limit hit, waiting %v before retry\n", delay)
+
+			// Wait for the specified delay
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(delay):
+				continue
+			}
+
+		case http.StatusUnauthorized,
+			http.StatusForbidden,
+			http.StatusNotFound:
+			// Don't retry on these status codes
 			return resp, nil
-		}
 
-		resp.Body.Close()
-		lastErr = fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		default:
+			resp.Body.Close()
+			lastErr = fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+			continue
+		}
 	}
 
 	return nil, fmt.Errorf("all retry attempts failed: %w", lastErr)
+}
+
+func getRetryDelay(resp *http.Response) time.Duration {
+	retryAfter := resp.Header.Get("Retry-After")
+	if retryAfter == "" {
+		return defaultRetryDelay
+	}
+
+	// Try to parse as seconds
+	if seconds, err := strconv.Atoi(retryAfter); err == nil {
+		return time.Duration(seconds) * time.Second
+	}
+
+	// Try to parse as HTTP date
+	if date, err := time.Parse(time.RFC1123, retryAfter); err == nil {
+		return time.Until(date)
+	}
+
+	return defaultRetryDelay
 }
