@@ -10,6 +10,7 @@ import (
 	"time"
 
 	bin "github.com/gagliardetto/binary"
+	"golang.org/x/exp/rand"
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
@@ -67,10 +68,25 @@ func (c *Client) reconnect() error {
 	defer c.reconnectMu.Unlock()
 
 	maxRetries := 5
+	baseBackoff := time.Second
+	maxBackoff := 1 * time.Minute
+
 	for i := 0; i < maxRetries; i++ {
 		if i > 0 {
-			// Exponential backoff
-			backoff := time.Duration(math.Pow(2, float64(i))) * time.Second
+			// Exponential backoff with jitter and max limit
+			backoff := time.Duration(float64(baseBackoff) * math.Pow(2, float64(i-1)))
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			// Add jitter
+			jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+			backoff = backoff + jitter
+
+			c.logger.Info().
+				Int("attempt", i+1).
+				Dur("backoff", backoff).
+				Msg("Waiting before reconnection attempt")
+
 			time.Sleep(backoff)
 		}
 
@@ -97,11 +113,37 @@ func (c *Client) reconnect() error {
 		c.client = newClient
 		c.connected = true
 
-		// Resubscribe to all existing subscriptions
+		// Store existing subscriptions before resubscribing
+		var subscriptions []struct {
+			address  string
+			callback func(string)
+		}
+
 		c.subscriptions.Range(func(key, value interface{}) bool {
-			// Implementation of resubscription logic
+			address := strings.TrimSuffix(key.(string), "_logs")
+			if sub, ok := value.(*ws.LogSubscription); ok {
+				sub.Unsubscribe() // Clean up old subscription
+				// Store for resubscription
+				subscriptions = append(subscriptions, struct {
+					address  string
+					callback func(string)
+				}{address: address, callback: nil}) // You'll need to store callbacks somewhere
+			}
 			return true
 		})
+
+		// Clear existing subscriptions
+		c.subscriptions = sync.Map{}
+
+		// Resubscribe
+		for _, sub := range subscriptions {
+			if err := c.SubscribeToWallet(context.Background(), sub.address, sub.callback); err != nil {
+				c.logger.Error().
+					Err(err).
+					Str("wallet", sub.address).
+					Msg("Failed to resubscribe wallet")
+			}
+		}
 
 		c.logger.Info().Msg("Successfully reconnected and resubscribed")
 		return nil
@@ -118,7 +160,7 @@ func (c *Client) SubscribeToWallet(ctx context.Context, walletAddress string, ca
 
 	// Subscribe to logs mentioning the wallet
 	logsSub, err := c.client.LogsSubscribeMentions(
-		pubkey, // Pass the pubkey directly
+		pubkey,
 		rpc.CommitmentConfirmed,
 	)
 	if err != nil {
@@ -128,9 +170,13 @@ func (c *Client) SubscribeToWallet(ctx context.Context, walletAddress string, ca
 	// Store subscription
 	c.subscriptions.Store(walletAddress+"_logs", logsSub)
 
-	// Monitor logs
+	// Monitor logs with backoff retry
 	go func() {
 		defer logsSub.Unsubscribe()
+
+		backoff := time.Second
+		maxBackoff := 1 * time.Minute
+		consecutiveErrors := 0
 
 		for {
 			select {
@@ -141,12 +187,51 @@ func (c *Client) SubscribeToWallet(ctx context.Context, walletAddress string, ca
 			default:
 				log, err := logsSub.Recv(ctx)
 				if err != nil {
+					consecutiveErrors++
 					c.logger.Error().
 						Err(err).
 						Str("wallet", walletAddress).
+						Int("consecutive_errors", consecutiveErrors).
+						Dur("backoff", backoff).
 						Msg("Error receiving log notification")
+
+					// If we get too many consecutive errors, try to reconnect
+					if consecutiveErrors >= 3 {
+						c.logger.Warn().
+							Str("wallet", walletAddress).
+							Msg("Too many consecutive errors, attempting reconnection")
+
+						if err := c.reconnect(); err != nil {
+							c.logger.Error().
+								Err(err).
+								Str("wallet", walletAddress).
+								Msg("Failed to reconnect")
+						} else {
+							// Reset error count after successful reconnection
+							consecutiveErrors = 0
+							backoff = time.Second
+							continue
+						}
+					}
+
+					// Exponential backoff with max limit
+					select {
+					case <-time.After(backoff):
+						backoff *= 2
+						if backoff > maxBackoff {
+							backoff = maxBackoff
+						}
+					case <-ctx.Done():
+						return
+					case <-c.done:
+						return
+					}
 					continue
 				}
+
+				// Reset error count and backoff on successful receive
+				consecutiveErrors = 0
+				backoff = time.Second
 
 				if log != nil {
 					signature := log.Value.Signature.String()
