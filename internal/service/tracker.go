@@ -51,7 +51,10 @@ func NewWalletTracker(ctx context.Context, cfg Config, logger zerolog.Logger) (*
 	}
 	repo := repository.NewRepository(dbPool)
 
-	wsClient, err := websocket.NewClient(cfg.SolanaWebSocketURL, logger, cfg.SolanaRPCURL)
+	wsCfg := websocket.DefaultConfig()
+	wsCfg.WSURL = cfg.SolanaWebSocketURL
+	wsCfg.RPCURL = cfg.SolanaRPCURL
+	wsClient, err := websocket.NewClient(wsCfg, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create WebSocket client: %w", err)
 	}
@@ -180,7 +183,7 @@ func (wt *WalletTracker) startTrackingWallet(ctx context.Context, address string
 		wt.logger.Info().
 			Str("wallet", address).
 			Str("signature", signature).
-			Msg("Received transaction notification")
+			Msg("New transaction detected")
 
 		// Process transaction in a separate goroutine
 		go func() {
