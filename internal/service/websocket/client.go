@@ -153,101 +153,61 @@ func (c *Client) reconnect() error {
 }
 
 func (c *Client) SubscribeToWallet(ctx context.Context, walletAddress string, callback func(string)) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	pubkey := solana.MustPublicKeyFromBase58(walletAddress)
 
-	// Subscribe to logs mentioning the wallet
-	logsSub, err := c.client.LogsSubscribeMentions(
-		pubkey,
-		rpc.CommitmentConfirmed,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to subscribe to logs: %w", err)
-	}
+	backoff := time.Second
+	maxBackoff := time.Minute
 
-	// Store subscription
-	c.subscriptions.Store(walletAddress+"_logs", logsSub)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			sub, err := c.client.LogsSubscribeMentions(
+				pubkey,
+				rpc.CommitmentConfirmed,
+			)
+			if err != nil {
+				time.Sleep(backoff)
+				backoff = min(backoff*2, maxBackoff)
+				continue
+			}
 
-	// Monitor logs with backoff retry
-	go func() {
-		defer logsSub.Unsubscribe()
+			// Reset backoff on successful subscription
+			backoff = time.Second
 
-		backoff := time.Second
-		maxBackoff := 1 * time.Minute
-		consecutiveErrors := 0
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-c.done:
-				return
-			default:
-				log, err := logsSub.Recv(ctx)
+			// Handle messages
+			for {
+				log, err := sub.Recv(ctx)
 				if err != nil {
-					consecutiveErrors++
-					c.logger.Error().
-						Err(err).
-						Str("wallet", walletAddress).
-						Int("consecutive_errors", consecutiveErrors).
-						Dur("backoff", backoff).
-						Msg("Error receiving log notification")
-
-					// If we get too many consecutive errors, try to reconnect
-					if consecutiveErrors >= 3 {
-						c.logger.Warn().
-							Str("wallet", walletAddress).
-							Msg("Too many consecutive errors, attempting reconnection")
-
-						if err := c.reconnect(); err != nil {
-							c.logger.Error().
-								Err(err).
-								Str("wallet", walletAddress).
-								Msg("Failed to reconnect")
-						} else {
-							// Reset error count after successful reconnection
-							consecutiveErrors = 0
-							backoff = time.Second
-							continue
-						}
-					}
-
-					// Exponential backoff with max limit
-					select {
-					case <-time.After(backoff):
-						backoff *= 2
-						if backoff > maxBackoff {
-							backoff = maxBackoff
-						}
-					case <-ctx.Done():
-						return
-					case <-c.done:
-						return
-					}
-					continue
+					// Clean up and resubscribe
+					sub.Unsubscribe()
+					break
 				}
 
-				// Reset error count and backoff on successful receive
-				consecutiveErrors = 0
-				backoff = time.Second
-
-				if log != nil {
-					signature := log.Value.Signature.String()
-					c.logger.Info().
-						Str("wallet", walletAddress).
-						Str("signature", signature).
-						Strs("logs", log.Value.Logs).
-						Msg("Received new transaction")
-
-					callback(signature)
+				if log != nil && log.Value.Signature.String() != "" {
+					callback(log.Value.Signature.String())
 				}
 			}
 		}
-	}()
+	}
+}
 
-	return nil
+// Add health check
+func (c *Client) healthCheck(ctx context.Context) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !c.testConnection() {
+				c.reconnect()
+			}
+		}
+	}
 }
 
 func (c *Client) UnsubscribeFromWallet(ctx context.Context, address string) error {
