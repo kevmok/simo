@@ -47,204 +47,70 @@ func (p *TransactionParser) ParseTransaction(ctx context.Context, signature stri
 		Str("signature", signature).
 		Str("wallet", walletAddress).
 		Msg("Starting transaction parsing")
-	// Add retry logic with exponential backoff
-	var tx *rpc.GetTransactionResult
-	var err error
 
-	// Create uint64 pointer for MaxSupportedTransactionVersion
-	var maxVersion uint64 = 0
-
-	opts := &rpc.GetTransactionOpts{
-		MaxSupportedTransactionVersion: &maxVersion,
-		Commitment:                     rpc.CommitmentConfirmed,
+	tx, err := p.getTransactionWithRetry(ctx, signature)
+	if err != nil || tx == nil || tx.Meta.Err != nil {
+		return nil, err
 	}
 
-	maxRetries := 3
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		if attempt > 0 {
-			// Exponential backoff: 1s, 2s, 4s
-			backoffDuration := time.Duration(math.Pow(2, float64(attempt))) * time.Second
-			p.logger.Debug().
-				Str("signature", signature).
-				Int("attempt", attempt+1).
-				Str("backoff", backoffDuration.String()).
-				Msg("Retrying transaction fetch")
-			time.Sleep(backoffDuration)
-		}
-
-		// Single attempt first for debugging
-		tx, err = p.client.GetTransaction(
-			ctx,
-			solana.MustSignatureFromBase58(signature),
-			opts,
-		)
-
-		if err == nil {
-			p.logger.Debug().
-				Str("signature", signature).
-				Msg("Successfully fetched transaction")
-			break
-		}
-
-		// If it's the last attempt, return the error
-		if attempt == maxRetries-1 {
-			return nil, fmt.Errorf("failed to get transaction after %d attempts: %w", maxRetries, err)
-		}
-
-		// Log the retry attempt
-		p.logger.Debug().
-			Err(err).
-			Str("signature", signature).
-			Int("attempt", attempt+1).
-			Msg("Transaction fetch failed, will retry")
-	}
-
-	if tx == nil {
-		p.logger.Warn().
-			Str("signature", signature).
-			Msg("Transaction not found")
-		return nil, nil
-	}
-
-	// Skip if transaction failed
-	if tx.Meta.Err != nil {
-		p.logger.Debug().
-			Str("signature", signature).
-			Interface("error", tx.Meta.Err).
-			Msg("Skipping failed transaction")
-		return nil, nil
-	}
-
-	parsed_tx, err := tx.Transaction.GetTransaction()
-
-	// First check for DEX program
-	var dexProgram solana.PublicKey
-	for _, inst := range parsed_tx.Message.Instructions {
-		programID := parsed_tx.Message.AccountKeys[inst.ProgramIDIndex]
-		if constants.IsDEXProgram(programID) {
-			dexProgram = programID
-			p.logger.Debug().
-				Str("signature", signature).
-				Str("program", programID.String()).
-				Msg("Found DEX program")
-			break
-		}
-	}
-
+	parsed_tx, _ := tx.Transaction.GetTransaction()
+	dexProgram := findDEXProgram(parsed_tx)
 	if dexProgram.IsZero() {
-		p.logger.Debug().
-			Str("signature", signature).
-			Msg("Not a DEX transaction")
+		p.logger.Debug().Str("signature", signature).Msg("Not a DEX transaction")
 		return nil, nil
 	}
 
-	p.logger.Debug().
-		Str("signature", signature).
-		Int("postBalancesCount", len(tx.Meta.PostTokenBalances)).
-		Int("preBalancesCount", len(tx.Meta.PreTokenBalances)).
-		Msg("Starting token balance analysis")
+	changes := make(map[string]float64)
+	walletPubkey := solana.MustPublicKeyFromBase58(walletAddress)
 
-		// Get token mint addresses and amounts directly from the transaction
-	var tokenIn, tokenOut string
-	var amountIn, amountOut float64
+	for _, post := range tx.Meta.PostTokenBalances {
+		isRelevantAccount := post.Owner.String() == walletAddress
+		if !isRelevantAccount {
+			expected, _, _ := solana.FindAssociatedTokenAddress(
+				walletPubkey, // Note: order switched to match solana.FindAssociatedTokenAddress
+				post.Mint,
+			)
+			isRelevantAccount = expected.String() == post.Owner.String() // Compare strings to avoid type mismatch
+		}
 
-	// First pass: Find the token being spent (input token)
-	for _, mint := range tx.Meta.PostTokenBalances {
 		p.logger.Debug().
 			Str("signature", signature).
-			Str("mintOwner", mint.Owner.String()).
+			Str("mintOwner", post.Owner.String()).
 			Str("expectedWallet", walletAddress).
-			Str("mintAddress", mint.Mint.String()).
-			Interface("uiTokenAmount", mint.UiTokenAmount).
+			Str("mintAddress", post.Mint.String()).
+			Bool("isRelevantAccount", isRelevantAccount).
+			Interface("uiTokenAmount", post.UiTokenAmount).
 			Msg("Analyzing post balance")
 
-		// For the input token, we can be strict about ownership
-		if mint.Owner.String() == walletAddress {
-			for _, pre := range tx.Meta.PreTokenBalances {
-				if pre.AccountIndex == mint.AccountIndex {
-					if pre.UiTokenAmount.UiAmount == nil || mint.UiTokenAmount.UiAmount == nil {
-						continue
-					}
-					preAmount := *pre.UiTokenAmount.UiAmount
-					postAmount := *mint.UiTokenAmount.UiAmount
-					if postAmount < preAmount {
-						tokenIn = mint.Mint.String()
-						amountIn = preAmount - postAmount
-						p.logger.Debug().
-							Str("signature", signature).
-							Str("tokenIn", tokenIn).
-							Float64("amountIn", amountIn).
-							Msg("Identified input token")
-					}
-				}
-			}
+		if !isRelevantAccount {
+			continue
 		}
-	}
 
-	// Second pass: Find the token being received (output token)
-	// For this pass, we'll look for any increase in token balance
-	for _, mint := range tx.Meta.PostTokenBalances {
 		for _, pre := range tx.Meta.PreTokenBalances {
-			if pre.AccountIndex == mint.AccountIndex {
-				if pre.UiTokenAmount.UiAmount == nil || mint.UiTokenAmount.UiAmount == nil {
-					continue
-				}
-				preAmount := *pre.UiTokenAmount.UiAmount
-				postAmount := *mint.UiTokenAmount.UiAmount
+			if pre.AccountIndex != post.AccountIndex {
+				continue
+			}
 
-				// Check for balance increase
-				if postAmount > preAmount {
-					// Special case for SOL token
-					if mint.Mint.String() == "So11111111111111111111111111111111111111112" {
-						tokenOut = mint.Mint.String()
-						amountOut = postAmount - preAmount
-						p.logger.Debug().
-							Str("signature", signature).
-							Str("tokenOut", tokenOut).
-							Float64("amountOut", amountOut).
-							Msg("Identified output token (SOL)")
-					} else if mint.Owner.String() == walletAddress {
-						// For other tokens, verify ownership
-						tokenOut = mint.Mint.String()
-						amountOut = postAmount - preAmount
-						p.logger.Debug().
-							Str("signature", signature).
-							Str("tokenOut", tokenOut).
-							Float64("amountOut", amountOut).
-							Msg("Identified output token")
-					}
-				}
+			if pre.UiTokenAmount.UiAmount == nil || post.UiTokenAmount.UiAmount == nil {
+				continue
+			}
+
+			diff := *post.UiTokenAmount.UiAmount - *pre.UiTokenAmount.UiAmount
+			if diff != 0 {
+				changes[post.Mint.String()] = diff
+				p.logger.Debug().
+					Str("signature", signature).
+					Str("mint", post.Mint.String()).
+					Float64("difference", diff).
+					Msg("Found balance change")
 			}
 		}
 	}
 
-	// Log before the token check
-	p.logger.Debug().
-		Str("signature", signature).
-		Str("tokenIn", tokenIn).
-		Str("tokenOut", tokenOut).
-		Bool("hasTokenIn", tokenIn != "").
-		Bool("hasTokenOut", tokenOut != "").
-		Msg("Token identification complete")
-
-	// If we couldn't identify both tokens, skip this transaction
+	tokenIn, tokenOut, amountIn, amountOut := p.identifyTokens(changes)
 	if tokenIn == "" || tokenOut == "" {
-		p.logger.Debug().
-			Str("signature", signature).
-			Str("tokenIn", tokenIn).
-			Str("tokenOut", tokenOut).
-			Msg("Could not identify both tokens, skipping transaction")
 		return nil, nil
 	}
-
-	p.logger.Debug().
-		Str("signature", signature).
-		Str("tokenIn", tokenIn).
-		Str("tokenOut", tokenOut).
-		Float64("amountIn", amountIn).
-		Float64("amountOut", amountOut).
-		Str("program", getProgramName(dexProgram)).
-		Msg("Parsed swap transaction")
 
 	return &TokenTransaction{
 		WalletAddress: walletAddress,
@@ -255,6 +121,80 @@ func (p *TransactionParser) ParseTransaction(ctx context.Context, signature stri
 		Signature:     signature,
 		Program:       getProgramName(dexProgram),
 	}, nil
+}
+
+func (p *TransactionParser) getTransactionWithRetry(ctx context.Context, signature string) (*rpc.GetTransactionResult, error) {
+	var tx *rpc.GetTransactionResult
+	var err error
+
+	opts := &rpc.GetTransactionOpts{
+		MaxSupportedTransactionVersion: new(uint64),
+		Commitment:                     rpc.CommitmentConfirmed,
+	}
+
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			backoffDuration := time.Duration(math.Pow(2, float64(attempt))) * time.Second
+			time.Sleep(backoffDuration)
+		}
+
+		tx, err = p.client.GetTransaction(ctx, solana.MustSignatureFromBase58(signature), opts)
+		if err == nil {
+			break
+		}
+
+		if attempt == maxRetries-1 {
+			return nil, fmt.Errorf("failed to get transaction after %d attempts: %w", maxRetries, err)
+		}
+	}
+
+	return tx, err
+}
+
+func (p *TransactionParser) calculateBalanceChanges(tx *rpc.GetTransactionResult, post *rpc.TokenBalance, changes map[string]float64) map[string]float64 {
+	for _, pre := range tx.Meta.PreTokenBalances {
+		if pre.AccountIndex != post.AccountIndex {
+			continue
+		}
+
+		if pre.UiTokenAmount.UiAmount == nil || post.UiTokenAmount.UiAmount == nil {
+			continue
+		}
+
+		diff := *post.UiTokenAmount.UiAmount - *pre.UiTokenAmount.UiAmount
+		if diff != 0 {
+			changes[post.Mint.String()] = diff
+		}
+	}
+	return changes
+}
+
+func (p *TransactionParser) identifyTokens(changes map[string]float64) (string, string, float64, float64) {
+	var tokenIn, tokenOut string
+	var amountIn, amountOut float64
+
+	for token, change := range changes {
+		if change < 0 {
+			tokenIn = token
+			amountIn = -change
+		} else {
+			tokenOut = token
+			amountOut = change
+		}
+	}
+
+	return tokenIn, tokenOut, amountIn, amountOut
+}
+
+func findDEXProgram(tx *solana.Transaction) solana.PublicKey {
+	for _, inst := range tx.Message.Instructions {
+		programID := tx.Message.AccountKeys[inst.ProgramIDIndex]
+		if constants.IsDEXProgram(programID) {
+			return programID
+		}
+	}
+	return solana.PublicKey{}
 }
 
 func getProgramName(programID solana.PublicKey) string {
@@ -268,11 +208,4 @@ func getProgramName(programID solana.PublicKey) string {
 	default:
 		return "Unknown"
 	}
-}
-
-func abs64(x float64) float64 {
-	if x < 0 {
-		return -x
-	}
-	return x
 }
