@@ -204,6 +204,11 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 
 	// If it's not a token transaction we care about, ignore it
 	if tokenTx == nil {
+		wt.logger.Info().
+			Str("wallet", walletAddress).
+			Str("signature", signature).
+			Interface("tx", tokenTx).
+			Msg("Not a token transaction")
 		return nil
 	}
 
@@ -246,6 +251,7 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 		Str("tokenOut", tokenOutInfo.Token.Name).
 		Str("tokenOutSymbol", tokenOutInfo.Token.Symbol).
 		Msg("Token info retrieved")
+
 	// Format and send Discord notification
 	message := fmt.Sprintf("# 💱 New Swap Alert\n"+
 		"### [View Wallet](https://solana.fm/address/%s) | [View Transaction](https://solscan.io/tx/%s)\n\n"+
@@ -271,6 +277,7 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 		wallet.Address,
 	)
 
+	wt.logger.Info().Msg("sending message to discord")
 	return wt.sendMessageToAllWebhooks(message)
 }
 

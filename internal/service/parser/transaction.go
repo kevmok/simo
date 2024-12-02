@@ -107,9 +107,13 @@ func (p *TransactionParser) ParseTransaction(ctx context.Context, signature stri
 			}
 		}
 	}
-
+	p.logger.Log().Interface("changes", changes).Msg("Identifiying tokens...")
 	tokenIn, tokenOut, amountIn, amountOut := p.identifyTokens(changes)
 	if tokenIn == "" || tokenOut == "" {
+		p.logger.Log().
+			Str("signature", signature).
+			Str("wallet", walletAddress).
+			Msg("No token changes detected")
 		return nil, nil
 	}
 
