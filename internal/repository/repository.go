@@ -152,14 +152,52 @@ func (r *PostgresRepository) AddTransaction(ctx context.Context, tx *Transaction
 }
 
 func (r *PostgresRepository) RemoveWallet(ctx context.Context, address string) error {
-	query := `DELETE FROM wallets WHERE address = $1`
-	result, err := r.db.Exec(ctx, query, address)
+	// Start a transaction
+	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback(ctx) // Rollback if something goes wrong
+
+	// First, get the wallet ID
+	var walletID int
+	getWalletIDQuery := `SELECT id FROM wallets WHERE address = $1`
+	err = tx.QueryRow(ctx, getWalletIDQuery, address).Scan(&walletID)
+	if err != nil {
+		return ErrWalletNotFound
+	}
+
+	// Delete related token positions
+	deletePositionsQuery := `DELETE FROM token_positions WHERE wallet_id = $1`
+	_, err = tx.Exec(ctx, deletePositionsQuery, walletID)
+	if err != nil {
+		return err
+	}
+
+	// Delete related transactions
+	deleteTransactionsQuery := `DELETE FROM transactions WHERE wallet_id = $1`
+	_, err = tx.Exec(ctx, deleteTransactionsQuery, walletID)
+	if err != nil {
+		return err
+	}
+
+	// Finally, delete the wallet
+	deleteWalletQuery := `DELETE FROM wallets WHERE id = $1`
+	result, err := tx.Exec(ctx, deleteWalletQuery, walletID)
+	if err != nil {
+		return err
+	}
+
 	if result.RowsAffected() == 0 {
 		return ErrWalletNotFound
 	}
+
+	// Commit the transaction
+	err = tx.Commit(ctx)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
