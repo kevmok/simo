@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"simo/internal/constants"
+	"strings"
 	"time"
 
 	"github.com/gagliardetto/solana-go"
@@ -140,8 +141,17 @@ func (p *TransactionParser) getTransactionWithRetry(ctx context.Context, signatu
 		}
 
 		tx, err = p.client.GetTransaction(ctx, solana.MustSignatureFromBase58(signature), opts)
-		if err == nil {
-			break
+		if err == nil && tx != nil {
+			// Check both Meta.Err and Status.Err
+			if tx.Meta != nil && tx.Meta.Err == nil {
+				break
+			}
+		}
+
+		// Special handling for "not found"
+		if err != nil && strings.Contains(err.Error(), "not found") {
+			time.Sleep(time.Second)
+			continue
 		}
 
 		if attempt == maxRetries-1 {
