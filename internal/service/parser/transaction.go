@@ -188,15 +188,34 @@ func (p *TransactionParser) identifyTokens(changes map[string]float64) (string, 
 	var tokenIn, tokenOut string
 	var amountIn, amountOut float64
 
+	p.logger.Debug().
+		Interface("changes", changes).
+		Msg("Starting to identify tokens from changes")
+
 	for token, change := range changes {
 		if change < 0 {
 			tokenIn = token
 			amountIn = -change
+			p.logger.Debug().
+				Str("token", token).
+				Float64("amount", -change).
+				Msg("Identified token IN")
 		} else {
 			tokenOut = token
 			amountOut = change
+			p.logger.Debug().
+				Str("token", token).
+				Float64("amount", change).
+				Msg("Identified token OUT")
 		}
 	}
+
+	p.logger.Debug().
+		Str("tokenIn", tokenIn).
+		Str("tokenOut", tokenOut).
+		Float64("amountIn", amountIn).
+		Float64("amountOut", amountOut).
+		Msg("Token identification complete")
 
 	return tokenIn, tokenOut, amountIn, amountOut
 }
