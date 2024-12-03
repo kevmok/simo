@@ -36,10 +36,14 @@ type SwapDetails struct {
 	DEXProgram string
 }
 
+const (
+	WrappedSOLMint = "So11111111111111111111111111111111111111112"
+)
+
 func NewTransactionParser(rpcURL string, logger zerolog.Logger) *TransactionParser {
 	return &TransactionParser{
 		client: rpc.New(rpcURL),
-		logger: logger,
+		logger: logger.With().Str("component", "transaction_parser").Logger(),
 	}
 }
 
@@ -50,70 +54,37 @@ func (p *TransactionParser) ParseTransaction(ctx context.Context, signature stri
 		Msg("Starting transaction parsing")
 
 	tx, err := p.getTransactionWithRetry(ctx, signature)
-	if err != nil || tx == nil || tx.Meta.Err != nil {
-		return nil, err
+	if err != nil || tx == nil || tx.Meta == nil || tx.Meta.Err != nil {
+		return nil, fmt.Errorf("failed to get or invalid transaction: %w", err)
 	}
 
-	parsed_tx, _ := tx.Transaction.GetTransaction()
+	parsed_tx, err := tx.Transaction.GetTransaction()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse transaction: %w", err)
+	}
+
 	dexProgram := findDEXProgram(parsed_tx)
 	if dexProgram.IsZero() {
 		p.logger.Debug().Str("signature", signature).Msg("Not a DEX transaction")
 		return nil, nil
 	}
 
-	changes := make(map[string]float64)
-	walletPubkey := solana.MustPublicKeyFromBase58(walletAddress)
+	// Track all balance changes
+	changes := p.calculateBalanceChanges(tx, walletAddress)
 
-	for _, post := range tx.Meta.PostTokenBalances {
-		isRelevantAccount := post.Owner.String() == walletAddress
-		if !isRelevantAccount {
-			expected, _, _ := solana.FindAssociatedTokenAddress(
-				walletPubkey, // Note: order switched to match solana.FindAssociatedTokenAddress
-				post.Mint,
-			)
-			isRelevantAccount = expected.String() == post.Owner.String() // Compare strings to avoid type mismatch
-		}
+	// Special handling for SOL (both native and wrapped)
+	p.handleSOLChanges(tx, walletAddress, changes)
 
-		p.logger.Debug().
-			Str("signature", signature).
-			Str("mintOwner", post.Owner.String()).
-			Str("expectedWallet", walletAddress).
-			Str("mintAddress", post.Mint.String()).
-			Bool("isRelevantAccount", isRelevantAccount).
-			Interface("uiTokenAmount", post.UiTokenAmount).
-			Msg("Analyzing post balance")
+	p.logger.Debug().
+		Interface("changes", changes).
+		Msg("Token balance changes calculated")
 
-		if !isRelevantAccount {
-			continue
-		}
-
-		for _, pre := range tx.Meta.PreTokenBalances {
-			if pre.AccountIndex != post.AccountIndex {
-				continue
-			}
-
-			if pre.UiTokenAmount.UiAmount == nil || post.UiTokenAmount.UiAmount == nil {
-				continue
-			}
-
-			diff := *post.UiTokenAmount.UiAmount - *pre.UiTokenAmount.UiAmount
-			if diff != 0 {
-				changes[post.Mint.String()] = diff
-				p.logger.Debug().
-					Str("signature", signature).
-					Str("mint", post.Mint.String()).
-					Float64("difference", diff).
-					Msg("Found balance change")
-			}
-		}
-	}
-	p.logger.Log().Interface("changes", changes).Msg("Identifiying tokens...")
 	tokenIn, tokenOut, amountIn, amountOut := p.identifyTokens(changes)
 	if tokenIn == "" || tokenOut == "" {
-		p.logger.Log().
+		p.logger.Debug().
 			Str("signature", signature).
-			Str("wallet", walletAddress).
-			Msg("No token changes detected")
+			Interface("changes", changes).
+			Msg("Insufficient token changes detected")
 		return nil, nil
 	}
 
@@ -121,8 +92,8 @@ func (p *TransactionParser) ParseTransaction(ctx context.Context, signature stri
 		WalletAddress: walletAddress,
 		TokenIn:       tokenIn,
 		TokenOut:      tokenOut,
-		AmountIn:      amountIn,
-		AmountOut:     amountOut,
+		AmountIn:      math.Abs(amountIn),  // Ensure positive
+		AmountOut:     math.Abs(amountOut), // Ensure positive
 		Signature:     signature,
 		Program:       getProgramName(dexProgram),
 	}, nil
@@ -166,47 +137,125 @@ func (p *TransactionParser) getTransactionWithRetry(ctx context.Context, signatu
 	return tx, err
 }
 
-func (p *TransactionParser) calculateBalanceChanges(tx *rpc.GetTransactionResult, post *rpc.TokenBalance, changes map[string]float64) map[string]float64 {
+func (p *TransactionParser) calculateBalanceChanges(tx *rpc.GetTransactionResult, walletAddress string) map[string]float64 {
+	changes := make(map[string]float64)
+	walletPubkey := solana.MustPublicKeyFromBase58(walletAddress)
+
+	// Create a map of pre-balances for quick lookup
+	preBalances := make(map[string]float64)
 	for _, pre := range tx.Meta.PreTokenBalances {
-		if pre.AccountIndex != post.AccountIndex {
+		if pre.UiTokenAmount.UiAmount != nil {
+			key := fmt.Sprintf("%d", pre.AccountIndex)
+			preBalances[key] = *pre.UiTokenAmount.UiAmount
+		}
+	}
+
+	// Get decoded transaction
+	decoded, err := tx.Transaction.GetTransaction()
+	if err != nil {
+		p.logger.Error().Err(err).Msg("Failed to decode transaction")
+		return changes
+	}
+
+	// Process post balances and calculate changes
+	for _, post := range tx.Meta.PostTokenBalances {
+		isRelevantAccount := false
+
+		// Check if direct ownership
+		if post.Owner.String() == walletAddress {
+			isRelevantAccount = true
+		} else {
+			// Check if it's an ATA
+			ata, _, _ := solana.FindAssociatedTokenAddress(walletPubkey, post.Mint)
+			accountKey := decoded.Message.AccountKeys[post.AccountIndex]
+			if ata.Equals(accountKey) {
+				isRelevantAccount = true
+			}
+		}
+
+		p.logger.Debug().
+			Str("mint", post.Mint.String()).
+			Str("owner", post.Owner.String()).
+			Bool("isRelevant", isRelevantAccount).
+			Msg("Checking account relevance")
+
+		if !isRelevantAccount {
 			continue
 		}
 
-		if pre.UiTokenAmount.UiAmount == nil || post.UiTokenAmount.UiAmount == nil {
+		if post.UiTokenAmount.UiAmount == nil {
 			continue
 		}
 
-		diff := *post.UiTokenAmount.UiAmount - *pre.UiTokenAmount.UiAmount
+		postAmount := *post.UiTokenAmount.UiAmount
+		key := fmt.Sprintf("%d", post.AccountIndex)
+		preAmount := preBalances[key]
+
+		diff := postAmount - preAmount
 		if diff != 0 {
 			changes[post.Mint.String()] = diff
 		}
 	}
+
 	return changes
+}
+
+func (p *TransactionParser) handleSOLChanges(tx *rpc.GetTransactionResult, walletAddress string, changes map[string]float64) {
+	// Handle native SOL balance changes
+	if len(tx.Meta.PreBalances) > 0 && len(tx.Meta.PostBalances) > 0 {
+		walletIndex := -1
+		// Get decoded transaction
+		decoded, err := tx.Transaction.GetTransaction()
+		if err != nil {
+			p.logger.Error().Err(err).Msg("Failed to decode transaction for SOL balance check")
+			return
+		}
+
+		for i, key := range decoded.Message.AccountKeys {
+			if key.String() == walletAddress {
+				walletIndex = i
+				break
+			}
+		}
+
+		if walletIndex >= 0 && walletIndex < len(tx.Meta.PreBalances) {
+			preBalance := float64(tx.Meta.PreBalances[walletIndex]) / 1e9 // Convert lamports to SOL
+			postBalance := float64(tx.Meta.PostBalances[walletIndex]) / 1e9
+
+			solChange := postBalance - preBalance
+			if math.Abs(solChange) > 0.00001 { // Filter out dust
+				// Add to wrapped SOL changes or create new entry
+				if existing, ok := changes[WrappedSOLMint]; ok {
+					changes[WrappedSOLMint] = existing + solChange
+				} else {
+					changes[WrappedSOLMint] = solChange
+				}
+			}
+		}
+	}
 }
 
 func (p *TransactionParser) identifyTokens(changes map[string]float64) (string, string, float64, float64) {
 	var tokenIn, tokenOut string
 	var amountIn, amountOut float64
 
-	p.logger.Debug().
-		Interface("changes", changes).
-		Msg("Starting to identify tokens from changes")
-
+	// Sort changes by absolute value to prioritize larger changes
 	for token, change := range changes {
+		p.logger.Debug().
+			Str("token", token).
+			Float64("change", change).
+			Msg("Processing token change")
+
 		if change < 0 {
-			tokenIn = token
-			amountIn = -change
-			p.logger.Debug().
-				Str("token", token).
-				Float64("amount", -change).
-				Msg("Identified token IN")
+			if math.Abs(change) > math.Abs(amountIn) {
+				tokenIn = token
+				amountIn = change
+			}
 		} else {
-			tokenOut = token
-			amountOut = change
-			p.logger.Debug().
-				Str("token", token).
-				Float64("amount", change).
-				Msg("Identified token OUT")
+			if change > amountOut {
+				tokenOut = token
+				amountOut = change
+			}
 		}
 	}
 
