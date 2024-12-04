@@ -77,7 +77,13 @@ func main() {
 		logger.Info().
 			Str("signal", sig.String()).
 			Msg("Received shutdown signal")
-			// Shutdown with timeout
+
+		//  Stop the tracker to clean up any open websocket connections
+		logger.Info().Msg("Stopping wallet tracker...")
+		tracker.Close()
+
+		// Shut http server
+		// Shutdown with timeout
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer shutdownCancel()
 

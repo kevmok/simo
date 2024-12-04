@@ -9,6 +9,7 @@ import (
 	"simo/internal/service/websocket"
 	"simo/pkg/discord"
 	"simo/pkg/solanatracker"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -33,6 +34,8 @@ type WalletTracker struct {
 	solTracker *solanatracker.Client
 	parser     *parser.TransactionParser
 	logger     zerolog.Logger
+	closed     bool
+	mu         sync.Mutex
 }
 
 type Config struct {
@@ -111,12 +114,48 @@ func NewWalletTracker(ctx context.Context, cfg Config, logger zerolog.Logger) (*
 }
 
 func (wt *WalletTracker) Close() {
-	if wt.wsClient != nil {
-		wt.wsClient.Close()
+	wt.mu.Lock()
+	if wt.closed {
+		wt.mu.Unlock()
+		return
 	}
+	wt.closed = true
+	wt.mu.Unlock()
+
+	// Create a context with timeout for graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wt.logger.Info().Msg("starting graceful shutdown of wallet tracker")
+
+	// First unsubscribe all wallets
+	wallets, err := wt.GetWallets(ctx)
+	if err != nil {
+		wt.logger.Error().Err(err).Msg("failed to get wallets during shutdown")
+	} else {
+		for _, wallet := range wallets {
+			if err := wt.wsClient.UnsubscribeFromWallet(ctx, wallet.Address); err != nil {
+				wt.logger.Error().
+					Err(err).
+					Str("wallet", wallet.Address).
+					Msg("failed to unsubscribe wallet during shutdown")
+			}
+		}
+	}
+
+	// Then close the websocket client
+	if wt.wsClient != nil {
+		if err := wt.wsClient.Close(); err != nil {
+			wt.logger.Error().Err(err).Msg("failed to close websocket client")
+		}
+	}
+
+	// Finally close the database
 	if wt.db != nil {
 		wt.db.Close()
 	}
+
+	wt.logger.Info().Msg("wallet tracker shutdown complete")
 }
 
 func (wt *WalletTracker) AddWallet(ctx context.Context, address string) error {

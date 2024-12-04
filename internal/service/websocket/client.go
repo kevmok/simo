@@ -294,16 +294,31 @@ func (c *Client) UnsubscribeFromWallet(ctx context.Context, address string) erro
 }
 
 func (c *Client) Close() error {
-	c.cancelFunc()
-	c.wg.Wait()
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Cancel context to stop all goroutines
+	c.cancelFunc()
+
+	// Unsubscribe all active subscriptions
+	c.subscriptions.Range(func(key, value interface{}) bool {
+		if sub, ok := value.(*Subscription); ok && sub.Sub != nil {
+			sub.Sub.Unsubscribe()
+		}
+		c.subscriptions.Delete(key)
+		return true
+	})
+
+	// Close the client connection
 	if c.client != nil {
 		c.client.Close()
 		c.client = nil
 	}
+
+	c.connected = false
+
+	// Wait for all goroutines to finish
+	c.wg.Wait()
 
 	return nil
 }
