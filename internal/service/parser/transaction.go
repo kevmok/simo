@@ -150,13 +150,6 @@ func (p *TransactionParser) calculateBalanceChanges(tx *rpc.GetTransactionResult
 		}
 	}
 
-	// Get decoded transaction
-	decoded, err := tx.Transaction.GetTransaction()
-	if err != nil {
-		p.logger.Error().Err(err).Msg("Failed to decode transaction")
-		return changes
-	}
-
 	// Process post balances and calculate changes
 	for _, post := range tx.Meta.PostTokenBalances {
 		isRelevantAccount := false
@@ -167,6 +160,22 @@ func (p *TransactionParser) calculateBalanceChanges(tx *rpc.GetTransactionResult
 		} else {
 			// Check if it's an ATA
 			ata, _, _ := solana.FindAssociatedTokenAddress(walletPubkey, post.Mint)
+			// Get decoded transaction
+			decoded, err := tx.Transaction.GetTransaction()
+			if err != nil {
+				p.logger.Error().Err(err).Msg("Failed to decode transaction for ATA check")
+				continue
+			}
+
+			// Bounds check
+			if int(post.AccountIndex) >= len(decoded.Message.AccountKeys) {
+				p.logger.Error().
+					Uint16("accountIndex", post.AccountIndex).
+					Int("accountKeysLength", len(decoded.Message.AccountKeys)).
+					Msg("Account index out of bounds")
+				continue
+			}
+
 			accountKey := decoded.Message.AccountKeys[post.AccountIndex]
 			if ata.Equals(accountKey) {
 				isRelevantAccount = true
