@@ -247,6 +247,14 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 		wt.logger.Warn().Err(err).Str("token", tokenTx.TokenOut).Msg("Failed to get token info")
 	}
 
+	var pnl *solanatracker.ProfitLoss
+	if tokenOutInfo.Token.Mint != "So11111111111111111111111111111111111111112" {
+		pnl, err = wt.solTracker.GetProfitLoss(ctx, walletAddress, tokenOutInfo.Token.Mint)
+		if err != nil {
+			wt.logger.Warn().Err(err).Str("token", tokenTx.TokenOut).Msg("Failed to get profit loss")
+		}
+	}
+
 	// log token in info and out info
 	wt.logger.Info().
 		Str("tokenIn", tokenInInfo.Token.Name).
@@ -268,7 +276,9 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 		"> Address: `%s`\n\n"+
 		"**Details**\n"+
 		"> 🏦 DEX: `%s`\n"+
-		"> 👛 Wallet: `%s`",
+		"> 👛 Wallet: `%s`\n"+
+		"> 🤑 PNL Realized: `%.6f`\n"+
+		"> 💰 PNL Unrealized: `%.6f`\n",
 		wallet.Address, tokenTx.Signature,
 		tokenInInfo.Token.Name, tokenInInfo.Token.Symbol,
 		tokenTx.AmountIn, tokenInInfo.Token.Symbol,
@@ -278,6 +288,8 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 		tokenTx.TokenOut,
 		tokenTx.Program,
 		wallet.Address,
+		pnl.Realized,
+		pnl.Unrealized,
 	)
 
 	wt.logger.Info().Msg("sending message to discord")
