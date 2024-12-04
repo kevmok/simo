@@ -246,6 +246,13 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 	if err != nil {
 		wt.logger.Warn().Err(err).Str("token", tokenTx.TokenOut).Msg("Failed to get token info")
 	}
+	// log token in info and out info
+	wt.logger.Info().
+		Str("tokenIn", tokenInInfo.Token.Name).
+		Str("tokenInSymbol", tokenInInfo.Token.Symbol).
+		Str("tokenOut", tokenOutInfo.Token.Name).
+		Str("tokenOutSymbol", tokenOutInfo.Token.Symbol).
+		Msg("Token info retrieved")
 
 	var pnl *solanatracker.ProfitLoss
 	if tokenOutInfo.Token.Mint != "So11111111111111111111111111111111111111112" {
@@ -255,15 +262,6 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 		}
 	}
 
-	// log token in info and out info
-	wt.logger.Info().
-		Str("tokenIn", tokenInInfo.Token.Name).
-		Str("tokenInSymbol", tokenInInfo.Token.Symbol).
-		Str("tokenOut", tokenOutInfo.Token.Name).
-		Str("tokenOutSymbol", tokenOutInfo.Token.Symbol).
-		Msg("Token info retrieved")
-
-	// Format and send Discord notification
 	message := fmt.Sprintf("# 💱 New Swap Alert\n"+
 		"### [View Wallet](https://solana.fm/address/%s) | [View Transaction](https://solscan.io/tx/%s)\n\n"+
 		"**From Token**\n"+
@@ -276,9 +274,7 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 		"> Address: `%s`\n\n"+
 		"**Details**\n"+
 		"> 🏦 DEX: `%s`\n"+
-		"> 👛 Wallet: `%s`\n"+
-		"> 🤑 PNL Realized: `%.6f`\n"+
-		"> 💰 PNL Unrealized: `%.6f`\n",
+		"> 👛 Wallet: `%s`",
 		wallet.Address, tokenTx.Signature,
 		tokenInInfo.Token.Name, tokenInInfo.Token.Symbol,
 		tokenTx.AmountIn, tokenInInfo.Token.Symbol,
@@ -287,10 +283,14 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 		tokenTx.AmountOut, tokenOutInfo.Token.Symbol,
 		tokenTx.TokenOut,
 		tokenTx.Program,
-		wallet.Address,
-		pnl.Realized,
-		pnl.Unrealized,
-	)
+		wallet.Address)
+
+	// Add PNL information only if available
+	if pnl != nil {
+		message += fmt.Sprintf("\n> 🤑 PNL Realized: `%.6f`\n> 💰 PNL Unrealized: `%.6f`",
+			pnl.Realized,
+			pnl.Unrealized)
+	}
 
 	wt.logger.Info().Msg("sending message to discord")
 	return wt.sendMessageToAllWebhooks(message)

@@ -152,7 +152,7 @@ func (c *Client) GetProfitLoss(ctx context.Context, walletAddress, tokenAddress 
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("x-api-key", c.apiKey)
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doRequestWithRetry(req)
 	if err != nil {
 		return nil, fmt.Errorf("executing request: %w", err)
 	}
