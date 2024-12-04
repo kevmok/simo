@@ -3,6 +3,7 @@ package websocket
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -148,19 +149,31 @@ func (c *Client) monitorWallet(ctx context.Context, sub *Subscription) error {
 			if err != nil {
 				logger.Error().Err(err).Msg("error receiving log notification")
 
-				// Attempt reconnection
-				if err := c.reconnect(); err != nil {
-					logger.Error().Err(err).Msg("reconnection failed")
-					// Continue monitoring even if reconnection fails
+				// Check connection state before attempting reconnect
+				c.mu.RLock()
+				isConnected := c.connected && c.client != nil
+				c.mu.RUnlock()
+
+				if !isConnected || strings.Contains(err.Error(), "i/o timeout") {
+					logger.Warn().Msg("detected connection issue, attempting reconnection")
+
+					if err := c.reconnect(); err != nil {
+						logger.Error().Err(err).Msg("reconnection failed")
+						time.Sleep(time.Second) // Brief pause before next attempt
+						continue
+					}
+
+					if err := c.resubscribe(sub); err != nil {
+						logger.Error().Err(err).Msg("resubscription failed")
+						time.Sleep(time.Second) // Brief pause before next attempt
+						continue
+					}
+
+					logger.Info().Msg("successfully reconnected and resubscribed")
 					continue
 				}
 
-				// Resubscribe after successful reconnection
-				if err := c.resubscribe(sub); err != nil {
-					logger.Error().Err(err).Msg("resubscription failed")
-					continue
-				}
-
+				// For other types of errors, just continue monitoring
 				continue
 			}
 
@@ -293,6 +306,13 @@ func (c *Client) Close() error {
 	}
 
 	return nil
+}
+
+func min(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func exponentialBackoff(attempt int, min, max time.Duration) time.Duration {
