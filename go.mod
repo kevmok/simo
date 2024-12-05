@@ -13,6 +13,7 @@ require (
 )
 
 require (
+	github.com/eapache/go-resiliency v1.7.0 // indirect
 	github.com/gagliardetto/binary v0.8.0 // indirect
 	github.com/google/go-cmp v0.6.0 // indirect
 )

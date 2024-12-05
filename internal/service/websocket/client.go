@@ -3,13 +3,16 @@ package websocket
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
+	"github.com/eapache/go-resiliency/breaker"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/gagliardetto/solana-go/rpc/ws"
 	"github.com/rs/zerolog"
+	"github.com/sourcegraph/conc/iter"
 	"github.com/sourcegraph/conc/pool"
 	"golang.org/x/time/rate"
 )
@@ -23,6 +26,20 @@ type Config struct {
 	BackoffMax      time.Duration
 	HealthCheckFreq time.Duration
 	RateLimit       rate.Limit
+
+	// New connection-related configurations
+	ConnTimeout  time.Duration // Timeout for establishing connections
+	ReadTimeout  time.Duration // Timeout for read operations
+	WriteTimeout time.Duration // Timeout for write operations
+	BufferSize   int           // Size of message buffer channels
+
+	// Concurrency controls
+	WorkerCount int // Number of workers for subscription handling
+	BatchSize   int // Size of batches for subscription operations
+
+	// Circuit breaker settings
+	FailureThreshold int           // Number of failures before circuit opens
+	ResetTimeout     time.Duration // Time before attempting to close circuit
 }
 
 // DefaultConfig returns a default configuration
@@ -32,7 +49,17 @@ func DefaultConfig() Config {
 		BackoffMin:      time.Second,
 		BackoffMax:      time.Minute,
 		HealthCheckFreq: 15 * time.Second,
-		RateLimit:       rate.Every(100 * time.Millisecond), // 10 requests per second
+		RateLimit:       rate.Every(100 * time.Millisecond),
+
+		// New defaults
+		ConnTimeout:      10 * time.Second,
+		ReadTimeout:      5 * time.Second,
+		WriteTimeout:     5 * time.Second,
+		BufferSize:       1000,
+		WorkerCount:      runtime.GOMAXPROCS(0), // Use available CPU cores
+		BatchSize:        50,
+		FailureThreshold: 5,
+		ResetTimeout:     30 * time.Second,
 	}
 }
 
@@ -50,6 +77,17 @@ type Client struct {
 
 	mu        sync.RWMutex
 	connected bool
+
+	workerPool     *pool.ContextPool
+	batchPool      *pool.ContextPool
+	circuitBreaker *breaker.Breaker
+	messageQueue   chan *Message
+}
+
+type Message struct {
+	Address    string
+	Payload    interface{}
+	ReceivedAt time.Time
 }
 
 type Subscription struct {
@@ -59,23 +97,55 @@ type Subscription struct {
 }
 
 func NewClient(cfg Config, logger zerolog.Logger) (*Client, error) {
+	// Create a cancellable context for the entire client
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Initialize the client with all required components
 	c := &Client{
+		// Basic configuration
 		config:     cfg,
 		logger:     logger.With().Str("component", "websocket").Logger(),
-		limiter:    rate.NewLimiter(cfg.RateLimit, 1),
 		ctx:        ctx,
 		cancelFunc: cancel,
-		pool:       pool.New().WithContext(ctx).WithCancelOnError(),
+
+		// Rate limiting
+		limiter: rate.NewLimiter(cfg.RateLimit, 1),
+
+		// Connection state
+		connected: false,
+
+		// Concurrency components
+		pool: pool.New().WithContext(ctx).WithCancelOnError(),
+		workerPool: pool.New().WithContext(ctx).
+			WithMaxGoroutines(cfg.WorkerCount).
+			WithCancelOnError(),
+		batchPool: pool.New().WithContext(ctx).
+			WithMaxGoroutines(cfg.BatchSize).
+			WithCancelOnError(),
+
+		// Circuit breaker for connection management
+		circuitBreaker: breaker.New(
+			cfg.FailureThreshold,
+			1, // One success required to close
+			cfg.ResetTimeout,
+		),
+
+		// Message processing channel
+		messageQueue: make(chan *Message, cfg.BufferSize),
 	}
 
+	// Establish initial connection
 	if err := c.connect(); err != nil {
-		cancel()
+		cancel() // Clean up if connection fails
 		return nil, fmt.Errorf("initial connection failed: %w", err)
 	}
 
-	// Single goroutine for health checks
+	// Start the message processing system
+	c.pool.Go(func(ctx context.Context) error {
+		return c.processSubscriptions(ctx)
+	})
+
+	// Start the health check monitoring
 	c.pool.Go(func(ctx context.Context) error {
 		ticker := time.NewTicker(c.config.HealthCheckFreq)
 		defer ticker.Stop()
@@ -86,56 +156,93 @@ func NewClient(cfg Config, logger zerolog.Logger) (*Client, error) {
 				return ctx.Err()
 			case <-ticker.C:
 				if err := c.checkAndReconnect(); err != nil {
-					c.logger.Error().Err(err).Msg("reconnection failed")
+					c.logger.Error().
+						Err(err).
+						Msg("reconnection failed")
 				}
 			}
 		}
 	})
 
+	// Log successful initialization
+	c.logger.Info().
+		Int("worker_count", cfg.WorkerCount).
+		Int("batch_size", cfg.BatchSize).
+		Int("buffer_size", cfg.BufferSize).
+		Msg("websocket client initialized successfully")
+
 	return c, nil
 }
 
 func (c *Client) checkAndReconnect() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	return c.circuitBreaker.Run(func() error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 
-	if c.client == nil || !c.connected {
-		return c.reconnect()
-	}
+		if c.client == nil || !c.connected {
+			return c.reconnect()
+		}
 
-	// Simple ping test
-	testKey := solana.MustPublicKeyFromBase58("11111111111111111111111111111111")
-	if _, err := c.client.LogsSubscribeMentions(testKey, rpc.CommitmentConfirmed); err != nil {
-		return c.reconnect()
-	}
+		// Create a timeout context for the health check
+		ctx, cancel := context.WithTimeout(c.ctx, c.config.ReadTimeout)
+		defer cancel()
 
-	return nil
+		// Use the context in the health check subscription
+		testKey := solana.MustPublicKeyFromBase58("11111111111111111111111111111111")
+		sub, err := c.client.LogsSubscribeMentions(testKey, rpc.CommitmentConfirmed)
+		if err != nil {
+			return c.reconnect()
+		}
+
+		// Important: We need to properly clean up the test subscription
+		defer sub.Unsubscribe()
+
+		// Test receiving a message with the timeout context
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("health check timeout: %w", ctx.Err())
+		default:
+			// Try to receive one message to ensure the connection is truly alive
+			if _, err := sub.Recv(ctx); err != nil {
+				return c.reconnect()
+			}
+		}
+
+		return nil
+	})
 }
 
 func (c *Client) resubscribeAll() error {
-	p := pool.New().WithContext(c.ctx).WithCancelOnError()
-
+	// First, collect all subscriptions into a slice since iter.ForEach works with slices
+	var subs []*Subscription
 	c.subscriptions.Range(func(key, value interface{}) bool {
-		sub, ok := value.(*Subscription)
-		if !ok {
-			return true
+		if sub, ok := value.(*Subscription); ok {
+			subs = append(subs, sub)
 		}
-
-		p.Go(func(ctx context.Context) error {
-			if err := c.resubscribe(sub); err != nil {
-				return fmt.Errorf("failed to resubscribe %s: %w", sub.Address, err)
-			}
-			return nil
-		})
 		return true
 	})
 
-	// Wait for all resubscriptions and collect errors
-	if err := p.Wait(); err != nil {
-		return fmt.Errorf("resubscription failed: %w", err)
-	}
+	// Create a pool for parallel processing
+	p := pool.New().
+		WithContext(c.ctx).
+		WithMaxGoroutines(c.config.WorkerCount).
+		WithCancelOnError()
 
-	return nil
+	// Use iter.ForEach for parallel processing
+	iter.ForEach(subs, func(sub **Subscription) {
+		p.Go(func(ctx context.Context) error {
+			if err := c.resubscribe(*sub); err != nil {
+				c.logger.Error().
+					Err(err).
+					Str("address", (*sub).Address).
+					Msg("failed to resubscribe")
+				return err
+			}
+			return nil
+		})
+	})
+
+	return p.Wait()
 }
 
 func (c *Client) connect() error {
@@ -168,56 +275,73 @@ func (c *Client) connect() error {
 func (c *Client) SubscribeToWallet(ctx context.Context, address string, callback func(string)) error {
 	pubkey := solana.MustPublicKeyFromBase58(address)
 
-	sub, err := c.client.LogsSubscribeMentions(pubkey, rpc.CommitmentConfirmed)
-	if err != nil {
-		return fmt.Errorf("subscription failed: %w", err)
-	}
-
-	subscription := &Subscription{
-		Address:  address,
-		Callback: callback,
-		Sub:      sub,
-	}
-
-	c.subscriptions.Store(address, subscription)
-
-	// Monitor in background
-	c.pool.Go(func(ctx context.Context) error {
-		defer func() {
-			// Cleanup on exit
-			if sub != nil {
-				subscription.Sub.Unsubscribe()
-			}
-			c.subscriptions.Delete(address)
-		}()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-				if err := c.limiter.Wait(ctx); err != nil {
-					return err
-				}
-
-				got, err := subscription.Sub.Recv(ctx)
-				if err != nil {
-					// Trigger reconnect on error
-					if err := c.checkAndReconnect(); err != nil {
-						// If reconnect fails, wait before retry
-						time.Sleep(time.Second)
-					}
-					continue
-				}
-
-				if got != nil && got.Value.Signature != (solana.Signature{}) {
-					callback(got.Value.Signature.String())
-				}
-			}
+	// Execute subscription through circuit breaker
+	err := c.circuitBreaker.Run(func() error {
+		sub, err := c.client.LogsSubscribeMentions(pubkey, rpc.CommitmentConfirmed)
+		if err != nil {
+			return fmt.Errorf("subscription failed: %w", err)
 		}
+
+		subscription := &Subscription{
+			Address:  address,
+			Callback: callback,
+			Sub:      sub,
+		}
+
+		c.subscriptions.Store(address, subscription)
+
+		// Send messages to the processing queue
+		c.pool.Go(func(ctx context.Context) error {
+			defer func() {
+				if sub != nil {
+					subscription.Sub.Unsubscribe()
+				}
+				c.subscriptions.Delete(address)
+			}()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+					if err := c.limiter.Wait(ctx); err != nil {
+						return err
+					}
+
+					got, err := subscription.Sub.Recv(ctx)
+					if err != nil {
+						// Use exponential backoff for reconnection
+						for attempt := 0; attempt < c.config.MaxRetries; attempt++ {
+							if err := c.checkAndReconnect(); err != nil {
+								backoff := exponentialBackoff(attempt, c.config.BackoffMin, c.config.BackoffMax)
+								time.Sleep(backoff)
+								continue
+							}
+							break
+						}
+						continue
+					}
+
+					if got != nil && got.Value.Signature != (solana.Signature{}) {
+						// Send to message queue for processing
+						select {
+						case c.messageQueue <- &Message{
+							Address:    address,
+							Payload:    got.Value.Signature.String(),
+							ReceivedAt: time.Now(),
+						}:
+						default:
+							c.logger.Warn().Msg("message queue full, dropping message")
+						}
+					}
+				}
+			}
+		})
+
+		return nil
 	})
 
-	return nil
+	return err
 }
 
 func (c *Client) reconnect() error {
@@ -347,5 +471,81 @@ func (c *Client) setConnectionState(connected bool) {
 	if c.connected != connected {
 		c.connected = connected
 		c.logger.Info().Bool("connected", connected).Msg("connection state changed")
+	}
+}
+
+func (c *Client) processSubscriptions(ctx context.Context) error {
+	// Create a worker pool for processing messages
+	c.workerPool = pool.New().WithContext(ctx).WithMaxGoroutines(c.config.WorkerCount).WithCancelOnError()
+
+	// Create a buffered channel for messages
+	c.messageQueue = make(chan *Message, c.config.BufferSize)
+
+	// Start workers to process messages
+	for i := 0; i < c.config.WorkerCount; i++ {
+		c.workerPool.Go(func(ctx context.Context) error {
+			return c.processMessages(ctx)
+		})
+	}
+
+	return c.workerPool.Wait()
+}
+
+func (c *Client) processMessages(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case msg := <-c.messageQueue:
+			// Process message in batches using conc
+			if err := c.processBatch(ctx, msg); err != nil {
+				c.logger.Error().Err(err).Msg("batch processing failed")
+				continue
+			}
+		}
+	}
+}
+
+func (c *Client) processBatch(ctx context.Context, msg *Message) error {
+	var subs []*Subscription
+	c.subscriptions.Range(func(key, value interface{}) bool {
+		if sub, ok := value.(*Subscription); ok {
+			subs = append(subs, sub)
+		}
+		return true
+	})
+
+	// Create a batch pool with configured size
+	p := pool.New().
+		WithContext(ctx).
+		WithMaxGoroutines(c.config.BatchSize).
+		WithCancelOnError()
+
+	// Process subscriptions in parallel
+	iter.ForEach(subs, func(sub **Subscription) {
+		p.Go(func(ctx context.Context) error {
+			return c.handleSubscriptionMessage(ctx, *sub, msg)
+		})
+	})
+
+	return p.Wait()
+}
+
+func (c *Client) handleSubscriptionMessage(ctx context.Context, sub *Subscription, msg *Message) error {
+	// Add timeouts for operations
+	ctx, cancel := context.WithTimeout(ctx, c.config.ReadTimeout)
+	defer cancel()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		if err := c.limiter.Wait(ctx); err != nil {
+			return fmt.Errorf("rate limit exceeded: %w", err)
+		}
+
+		// Process the message for this subscription
+		sub.Callback(msg.Payload.(string))
+		return nil
 	}
 }
