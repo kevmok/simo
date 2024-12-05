@@ -186,7 +186,7 @@ func (c *Client) SubscribeToWallet(ctx context.Context, address string, callback
 		defer func() {
 			// Cleanup on exit
 			if sub != nil {
-				sub.Sub.Unsubscribe()
+				subscription.Sub.Unsubscribe()
 			}
 			c.subscriptions.Delete(address)
 		}()
