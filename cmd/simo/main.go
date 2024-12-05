@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"simo/internal/handler"
@@ -12,88 +15,157 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
 func main() {
-	// Load environment variables
-	if _, err := os.Stat(".env"); err == nil {
-		err := godotenv.Load()
-		if err != nil {
-			log.Fatal().Msg("Error loading .env file")
-		}
-		log.Info().Msg("Loaded .env file")
-	} else if os.IsNotExist(err) {
-		log.Info().Msg("No .env file found, continuing with default environment")
-	} else {
-		log.Info().Msgf("Error checking .env file: %v", err)
-	}
+    // Set up error channel to handle fatal errors from goroutines
+    errChan := make(chan error, 1)
 
-	// Initialize logger
-	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
+    // Create a base context with cancellation
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
 
-	config := service.Config{
-		SolanaRPCURL:       os.Getenv("SOLANA_RPC_URL"),
-		SolanaWebSocketURL: os.Getenv("SOLANA_WEBSOCKET_URL"),
-		SolanaTrackerKey:   os.Getenv("SOLANA_TRACKER_API_KEY"),
-	}
+    // Initialize logger first - this ensures we have logging before anything else
+    logger := zerolog.New(os.Stdout).
+        With().
+        Timestamp().
+        Caller().  // Added caller info for better debugging
+        Logger()
 
-	if config.SolanaTrackerKey == "" {
-		log.Fatal().Msg("SOLANA_TRACKER_API_KEY is required")
-	}
+    // Load environment with better error handling
+    if err := loadEnvironment(&logger); err != nil {
+        logger.Fatal().Err(err).Msg("Failed to load environment")
+    }
 
-	// Create a context that will be canceled on signal
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+    // Validate configuration
+    config := service.Config{
+        SolanaRPCURL:       os.Getenv("SOLANA_RPC_URL"),
+        SolanaWebSocketURL: os.Getenv("SOLANA_WEBSOCKET_URL"),
+        SolanaTrackerKey:   os.Getenv("SOLANA_TRACKER_API_KEY"),
+    }
 
-	tracker, err := service.NewWalletTracker(ctx, config, logger)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to initialize wallet tracker")
-	}
-	defer tracker.Close()
+    if err := validateConfig(config); err != nil {
+        logger.Fatal().Err(err).Msg("Invalid configuration")
+    }
 
-	// Initialize handler and server
-	h := handler.NewHandler(tracker, logger)
-	srv := server.NewServer(server.Config{
-		Port:            "8080",
-		ShutdownTimeout: 30 * time.Second,
-	}, h, logger)
+    // Initialize components with proper shutdown order
+    components, err := initializeComponents(ctx, config, &logger)
+    if err != nil {
+        logger.Fatal().Err(err).Msg("Failed to initialize components")
+    }
+    defer components.cleanup()
 
-	// Set up signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+    // Set up signal handling with buffered channel
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
-	// Start the server in a goroutine
-	go func() {
-		if err := srv.Start(); err != nil {
-			logger.Error().Err(err).Msg("Server error")
-			cancel() // Cancel main context if server fails
-		}
-	}()
+    // Start server in goroutine with error reporting
+    go func() {
+        if err := components.server.Start(); err != nil {
+            if !errors.Is(err, http.ErrServerClosed) {
+                errChan <- fmt.Errorf("server error: %w", err)
+            }
+        }
+    }()
 
-	// Wait for either a signal or context cancellation
-	select {
-	case sig := <-sigChan:
-		logger.Info().
-			Str("signal", sig.String()).
-			Msg("Received shutdown signal")
+    // Main event loop
+    select {
+    case sig := <-sigChan:
+        logger.Info().
+            Str("signal", sig.String()).
+            Msg("Received shutdown signal")
 
-		//  Stop the tracker to clean up any open websocket connections
-		logger.Info().Msg("Stopping wallet tracker...")
-		tracker.Close()
+        // Initiate graceful shutdown
+        shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+        defer shutdownCancel()
 
-		// Shut http server
-		// Shutdown with timeout
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer shutdownCancel()
+        if err := gracefulShutdown(shutdownCtx, components, &logger); err != nil {
+            logger.Error().Err(err).Msg("Graceful shutdown failed")
+            os.Exit(1)
+        }
 
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			logger.Error().Err(err).Msg("Server shutdown failed")
-		}
-	case <-ctx.Done():
-		logger.Info().Msg("Context canceled")
-	}
+    case err := <-errChan:
+        logger.Error().Err(err).Msg("Received fatal error")
+        // Trigger shutdown on fatal error
+        cancel()
 
-	// Perform graceful shutdown
-	logger.Info().Msg("Shutting down gracefully...")
+    case <-ctx.Done():
+        logger.Info().Msg("Context canceled")
+    }
+
+    logger.Info().Msg("Shutdown complete")
+}
+
+// Components holds all service components for coordinated shutdown
+type Components struct {
+    tracker *service.WalletTracker
+    server  *server.Server
+}
+
+func (c *Components) cleanup() {
+    if c.tracker != nil {
+        c.tracker.Close()
+    }
+}
+
+func loadEnvironment(logger *zerolog.Logger) error {
+    if _, err := os.Stat(".env"); err == nil {
+        if err := godotenv.Load(); err != nil {
+            return fmt.Errorf("failed to load .env: %w", err)
+        }
+        logger.Info().Msg("Loaded .env file")
+        return nil
+    } else if !os.IsNotExist(err) {
+        return fmt.Errorf("error checking .env file: %w", err)
+    }
+    logger.Info().Msg("No .env file found, using environment variables")
+    return nil
+}
+
+func validateConfig(config service.Config) error {
+    if config.SolanaTrackerKey == "" {
+        return errors.New("SOLANA_TRACKER_API_KEY is required")
+    }
+    if config.SolanaRPCURL == "" {
+        return errors.New("SOLANA_RPC_URL is required")
+    }
+    if config.SolanaWebSocketURL == "" {
+        return errors.New("SOLANA_WEBSOCKET_URL is required")
+    }
+    return nil
+}
+
+func initializeComponents(ctx context.Context, config service.Config, logger *zerolog.Logger) (*Components, error) {
+    // Initialize tracker with timeout
+    initCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+    defer cancel()
+
+    tracker, err := service.NewWalletTracker(initCtx, config, *logger)
+    if err != nil {
+        return nil, fmt.Errorf("failed to initialize wallet tracker: %w", err)
+    }
+
+    // Initialize handler and server
+    handler := handler.NewHandler(tracker, *logger)
+    srv := server.NewServer(server.Config{
+        Port:            "8080",
+        ShutdownTimeout: 30 * time.Second,
+    }, handler, *logger)
+
+    return &Components{
+        tracker: tracker,
+        server:  srv,
+    }, nil
+}
+
+func gracefulShutdown(ctx context.Context, components *Components, logger *zerolog.Logger) error {
+    // Stop accepting new connections first
+    if err := components.server.Shutdown(ctx); err != nil {
+        return fmt.Errorf("server shutdown failed: %w", err)
+    }
+
+    // Then close the tracker (websocket connections)
+    components.tracker.Close()
+
+    return nil
 }
