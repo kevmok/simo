@@ -294,8 +294,8 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 		Msg("Token info retrieved")
 
 	var pnl *solanatracker.ProfitLoss
-	if tokenOutInfo.Token.Mint != "So11111111111111111111111111111111111111112" {
-		pnl, err = wt.solTracker.GetProfitLoss(ctx, walletAddress, tokenOutInfo.Token.Mint)
+	if tokenInInfo.Token.Mint != "So11111111111111111111111111111111111111112" {
+		pnl, err = wt.solTracker.GetProfitLoss(ctx, walletAddress, tokenInInfo.Token.Mint)
 		if err != nil {
 			wt.logger.Warn().Err(err).Str("token", tokenTx.TokenOut).Msg("Failed to get profit loss")
 		}

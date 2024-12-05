@@ -41,15 +41,12 @@ type Client struct {
 	client *ws.Client
 	logger zerolog.Logger
 
-	subscriptions sync.Map // map[string]*Subscription
+	subscriptions sync.Map
 	limiter       *rate.Limiter
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
-
-	pool        *pool.ContextPool // conc pool for managing goroutines
-	reconnectCh chan struct{}
-	healthyCh   chan struct{}
+	pool       *pool.ContextPool
 
 	mu        sync.RWMutex
 	connected bool
@@ -65,14 +62,12 @@ func NewClient(cfg Config, logger zerolog.Logger) (*Client, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	c := &Client{
-		config:      cfg,
-		logger:      logger.With().Str("component", "websocket").Logger(),
-		limiter:     rate.NewLimiter(cfg.RateLimit, 1),
-		ctx:         ctx,
-		cancelFunc:  cancel,
-		pool:        pool.New().WithContext(ctx).WithCancelOnError(),
-		reconnectCh: make(chan struct{}, 1),
-		healthyCh:   make(chan struct{}, 1),
+		config:     cfg,
+		logger:     logger.With().Str("component", "websocket").Logger(),
+		limiter:    rate.NewLimiter(cfg.RateLimit, 1),
+		ctx:        ctx,
+		cancelFunc: cancel,
+		pool:       pool.New().WithContext(ctx).WithCancelOnError(),
 	}
 
 	if err := c.connect(); err != nil {
@@ -80,67 +75,41 @@ func NewClient(cfg Config, logger zerolog.Logger) (*Client, error) {
 		return nil, fmt.Errorf("initial connection failed: %w", err)
 	}
 
-	c.startConnectionManager()
-	return c, nil
-}
-
-func (c *Client) startConnectionManager() {
+	// Single goroutine for health checks
 	c.pool.Go(func(ctx context.Context) error {
-		healthTicker := time.NewTicker(c.config.HealthCheckFreq)
-		defer healthTicker.Stop()
+		ticker := time.NewTicker(c.config.HealthCheckFreq)
+		defer ticker.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-healthTicker.C:
-				if !c.isHealthy() {
-					c.triggerReconnect()
-				}
-			case <-c.reconnectCh:
-				if err := c.handleReconnection(); err != nil {
+			case <-ticker.C:
+				if err := c.checkAndReconnect(); err != nil {
 					c.logger.Error().Err(err).Msg("reconnection failed")
 				}
 			}
 		}
 	})
-}
-func (c *Client) triggerReconnect() {
-	select {
-	case c.reconnectCh <- struct{}{}:
-	default:
-		// Reconnection already queued
-	}
+
+	return c, nil
 }
 
-func (c *Client) handleReconnection() error {
-	c.logger.Info().Msg("starting reconnection process")
+func (c *Client) checkAndReconnect() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	backoffDuration := c.config.BackoffMin
-	attempts := 0
-
-	for attempts < c.config.MaxRetries {
-		if err := c.reconnect(); err == nil {
-			if err := c.resubscribeAll(); err == nil {
-				c.logger.Info().Msg("successfully reconnected and resubscribed")
-				return nil
-			} else {
-				c.logger.Error().Err(err).Msg("resubscription failed")
-			}
-		}
-
-		attempts++
-		backoffDuration = min(backoffDuration*2, c.config.BackoffMax)
-
-		select {
-		case <-c.ctx.Done():
-			return c.ctx.Err()
-		case <-time.After(backoffDuration):
-			continue
-		}
+	if c.client == nil || !c.connected {
+		return c.reconnect()
 	}
 
-	return fmt.Errorf("failed to reconnect after %d attempts", c.config.MaxRetries)
+	// Simple ping test
+	testKey := solana.MustPublicKeyFromBase58("11111111111111111111111111111111")
+	if _, err := c.client.LogsSubscribeMentions(testKey, rpc.CommitmentConfirmed); err != nil {
+		return c.reconnect()
+	}
+
+	return nil
 }
 
 func (c *Client) resubscribeAll() error {
@@ -212,106 +181,59 @@ func (c *Client) SubscribeToWallet(ctx context.Context, address string, callback
 
 	c.subscriptions.Store(address, subscription)
 
+	// Monitor in background
 	c.pool.Go(func(ctx context.Context) error {
-		return c.monitorWallet(ctx, subscription)
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				if err := c.limiter.Wait(ctx); err != nil {
+					return err
+				}
+
+				got, err := subscription.Sub.Recv(ctx)
+				if err != nil {
+					// Trigger reconnect on error
+					c.checkAndReconnect()
+					time.Sleep(time.Second) // Brief pause before retry
+					continue
+				}
+
+				if got != nil && got.Value.Signature != (solana.Signature{}) {
+					callback(got.Value.Signature.String())
+				}
+			}
+		}
 	})
 
 	return nil
 }
 
-func (c *Client) monitorWallet(ctx context.Context, sub *Subscription) error {
-	logger := c.logger.With().Str("wallet", sub.Address).Logger()
-	logger.Info().Msg("starting wallet monitoring")
-
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Error().
-				Interface("panic", r).
-				Msg("recovered from panic in monitorWallet")
-		}
-		if sub.Sub != nil {
-			logger.Debug().Msg("unsubscribing wallet subscription")
-			sub.Sub.Unsubscribe()
-		}
-		c.subscriptions.Delete(sub.Address)
-		logger.Info().Msg("wallet monitoring stopped")
-	}()
-
-	reconnectAttempts := 0
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			if err := c.limiter.Wait(ctx); err != nil {
-				return fmt.Errorf("rate limiter wait failed: %w", err)
-			}
-
-			got, err := sub.Sub.Recv(ctx)
-			if err != nil {
-				reconnectAttempts++
-				logger.Error().
-					Err(err).
-					Int("reconnect_attempt", reconnectAttempts).
-					Msg("error receiving log notification")
-
-				c.triggerReconnect()
-
-				select {
-				case <-c.healthyCh:
-					reconnectAttempts = 0
-					continue
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(30 * time.Second):
-					logger.Warn().Msg("timeout waiting for healthy connection")
-					if reconnectAttempts > c.config.MaxRetries {
-						return fmt.Errorf("max reconnection attempts reached")
-					}
-					continue
-				}
-			}
-
-			reconnectAttempts = 0
-			if got != nil && got.Value.Signature != (solana.Signature{}) {
-				logger.Debug().
-					Str("signature", got.Value.Signature.String()).
-					Msg("received transaction notification")
-				sub.Callback(got.Value.Signature.String())
-			}
-		}
-	}
-}
-
 func (c *Client) reconnect() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.client != nil {
-		c.logger.Info().Msg("closing existing connection")
 		c.client.Close()
 		c.client = nil
 	}
+	c.connected = false
 
-	var err error
-	for i := 0; i < c.config.MaxRetries; i++ {
-		if i > 0 {
-			backoff := exponentialBackoff(i, c.config.BackoffMin, c.config.BackoffMax)
-			time.Sleep(backoff)
-		}
-
-		if err = c.connect(); err == nil {
-			return nil
-		}
-
-		c.logger.Warn().
-			Err(err).
-			Int("attempt", i+1).
-			Int("max_attempts", c.config.MaxRetries).
-			Msg("reconnection attempt failed")
+	// Try to reconnect
+	if err := c.connect(); err != nil {
+		return err
 	}
 
-	return fmt.Errorf("failed to reconnect after %d attempts: %w", c.config.MaxRetries, err)
+	// Resubscribe all
+	var resubError error
+	c.subscriptions.Range(func(key, value interface{}) bool {
+		sub := value.(*Subscription)
+		if err := c.resubscribe(sub); err != nil {
+			resubError = err
+			return false
+		}
+		return true
+	})
+
+	return resubError
 }
 
 func (c *Client) resubscribe(sub *Subscription) error {
@@ -349,117 +271,29 @@ func (c *Client) UnsubscribeFromWallet(ctx context.Context, address string) erro
 }
 
 func (c *Client) Close() error {
+	c.cancelFunc()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.logger.Info().Msg("initiating websocket client shutdown")
-
-	// Cancel context first to stop all operations
-	c.cancelFunc()
-
-	// Clear channels
-	for len(c.reconnectCh) > 0 {
-		<-c.reconnectCh
-	}
-	for len(c.healthyCh) > 0 {
-		<-c.healthyCh
-	}
-
-	// Unsubscribe all active subscriptions
-	activeSubscriptions := 0
+	// Unsubscribe all
 	c.subscriptions.Range(func(key, value interface{}) bool {
 		if sub, ok := value.(*Subscription); ok && sub.Sub != nil {
-			c.logger.Debug().
-				Str("address", sub.Address).
-				Msg("unsubscribing from wallet")
 			sub.Sub.Unsubscribe()
-			activeSubscriptions++
 		}
 		c.subscriptions.Delete(key)
 		return true
 	})
 
-	// Close the client connection
 	if c.client != nil {
-		c.logger.Debug().Msg("closing websocket connection")
 		c.client.Close()
 		c.client = nil
 	}
 
 	c.connected = false
-
-	// Wait for all goroutines to finish
 	c.pool.Wait()
 
-	c.logger.Info().
-		Int("unsubscribed_wallets", activeSubscriptions).
-		Msg("websocket client shutdown complete")
-
 	return nil
-}
-
-func (c *Client) signalHealthy() {
-	select {
-	case c.healthyCh <- struct{}{}:
-	default:
-	}
-}
-
-func (c *Client) isHealthy() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if !c.connected || c.client == nil {
-		c.logger.Debug().Msg("connection check failed: client not connected")
-		return false
-	}
-
-	ctx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
-	defer cancel()
-
-	done := make(chan bool, 1)
-	cleanup := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		testKey := solana.MustPublicKeyFromBase58("11111111111111111111111111111111")
-		sub, err := c.client.LogsSubscribeMentions(testKey, rpc.CommitmentConfirmed)
-		if err != nil {
-			c.logger.Debug().Err(err).Msg("health check subscription failed")
-			done <- false
-			return
-		}
-
-		select {
-		case <-cleanup:
-			// Ensure cleanup happens if context is cancelled
-			if sub != nil {
-				sub.Unsubscribe()
-			}
-		case <-ctx.Done():
-			if sub != nil {
-				sub.Unsubscribe()
-			}
-		default:
-			if sub != nil {
-				sub.Unsubscribe()
-			}
-			done <- true
-		}
-	}()
-
-	select {
-	case result := <-done:
-		close(cleanup)
-		if result {
-			c.signalHealthy()
-		}
-		return result
-	case <-ctx.Done():
-		close(cleanup)
-		c.logger.Debug().Msg("health check timed out")
-		return false
-	}
 }
 
 func min(a, b time.Duration) time.Duration {
@@ -475,4 +309,13 @@ func exponentialBackoff(attempt int, min, max time.Duration) time.Duration {
 		return max
 	}
 	return backoff
+}
+
+func (c *Client) setConnectionState(connected bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.connected != connected {
+		c.connected = connected
+		c.logger.Info().Bool("connected", connected).Msg("connection state changed")
+	}
 }
