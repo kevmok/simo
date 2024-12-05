@@ -183,6 +183,14 @@ func (c *Client) SubscribeToWallet(ctx context.Context, address string, callback
 
 	// Monitor in background
 	c.pool.Go(func(ctx context.Context) error {
+		defer func() {
+			// Cleanup on exit
+			if sub != nil {
+				sub.Sub.Unsubscribe()
+			}
+			c.subscriptions.Delete(address)
+		}()
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -195,8 +203,10 @@ func (c *Client) SubscribeToWallet(ctx context.Context, address string, callback
 				got, err := subscription.Sub.Recv(ctx)
 				if err != nil {
 					// Trigger reconnect on error
-					c.checkAndReconnect()
-					time.Sleep(time.Second) // Brief pause before retry
+					if err := c.checkAndReconnect(); err != nil {
+						// If reconnect fails, wait before retry
+						time.Sleep(time.Second)
+					}
 					continue
 				}
 
@@ -211,11 +221,22 @@ func (c *Client) SubscribeToWallet(ctx context.Context, address string, callback
 }
 
 func (c *Client) reconnect() error {
+	// Clean up old client
 	if c.client != nil {
+		c.logger.Debug().Msg("closing old connection")
 		c.client.Close()
 		c.client = nil
 	}
 	c.connected = false
+
+	// Clean up old subscriptions
+	c.subscriptions.Range(func(key, value interface{}) bool {
+		if sub, ok := value.(*Subscription); ok && sub.Sub != nil {
+			sub.Sub.Unsubscribe()
+			sub.Sub = nil
+		}
+		return true
+	})
 
 	// Try to reconnect
 	if err := c.connect(); err != nil {
@@ -271,26 +292,35 @@ func (c *Client) UnsubscribeFromWallet(ctx context.Context, address string) erro
 }
 
 func (c *Client) Close() error {
+	// Cancel context first to stop all operations
 	c.cancelFunc()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Unsubscribe all
+	// Unsubscribe and clean up all subscriptions
 	c.subscriptions.Range(func(key, value interface{}) bool {
 		if sub, ok := value.(*Subscription); ok && sub.Sub != nil {
+			c.logger.Debug().
+				Str("address", sub.Address).
+				Msg("unsubscribing from wallet")
 			sub.Sub.Unsubscribe()
+			sub.Sub = nil
 		}
 		c.subscriptions.Delete(key)
 		return true
 	})
 
+	// Close the client connection
 	if c.client != nil {
+		c.logger.Debug().Msg("closing websocket connection")
 		c.client.Close()
 		c.client = nil
 	}
 
 	c.connected = false
+
+	// Wait for all goroutines to finish
 	c.pool.Wait()
 
 	return nil
