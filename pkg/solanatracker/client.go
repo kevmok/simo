@@ -14,7 +14,7 @@ const (
 	baseURL           = "https://data.solanatracker.io"
 	defaultTimeout    = 30 * time.Second
 	maxRetries        = 3
-	defaultRetryDelay = 5 * time.Second
+	defaultRetryDelay = 3 * time.Second
 )
 
 type Client struct {
@@ -55,6 +55,10 @@ type TokenInfo struct {
 		} `json:"price"`
 		Market      string `json:"market"`
 		LastUpdated int64  `json:"lastUpdated"`
+		MarketCap   struct {
+			Quote float64 `json:"quote"`
+			USD   float64 `json:"usd"`
+		} `json:"marketCap"`
 	} `json:"pools"`
 	Events struct {
 		OneHour struct {

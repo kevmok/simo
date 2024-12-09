@@ -433,18 +433,42 @@ func constructDiscordMessage(
 	formatTokenInfo := func(mint string, amount float64, info *solanatracker.TokenInfo) string {
 		if info == nil {
 			return fmt.Sprintf("> Unknown Token\n"+
-				"> Amount: `%.6f`\n"+
-				"> Address: `%s`", amount, mint)
+				"> **Amount**: `%.6f`\n"+
+				"> **Address**: `%s`", amount, mint)
 		}
 
 		return fmt.Sprintf("> %s (%s)\n"+
-			"> Amount: `%.6f %s`\n"+
-			"> Address: `%s`",
+			"> **Amount**: `%.6f %s`\n"+
+			"> **Address**: `%s`\n",
 			info.Token.Name,
 			info.Token.Symbol,
 			amount,
 			info.Token.Symbol,
 			mint)
+	}
+
+	addMarketCapAndRisks := func(info *solanatracker.TokenInfo) string {
+		if info == nil {
+			return ""
+		}
+
+		if info.Token.Mint == "So11111111111111111111111111111111111111112" {
+			return ""
+		}
+
+		// check that there's a risk score
+		var risks string
+		if len(info.Risk.Risks) != 0 {
+			risks = "> **Risks**:\n"
+			for _, risk := range info.Risk.Risks {
+				risks += fmt.Sprintf("> %s: %s\n", risk.Name, risk.Description)
+			}
+		}
+
+		return fmt.Sprintf("> **Market Cap**: `%.6f usd`\n"+
+			"%s\n\n",
+			info.Pools[0].MarketCap.USD,
+			risks)
 	}
 
 	// Construct the message by building each section
@@ -454,26 +478,30 @@ func constructDiscordMessage(
 		wallet.Address, swap.Signature)
 
 	// Add the token input section with detailed information about the source token
-	tokenInSection := fmt.Sprintf("**From Token**\n%s\n\n",
+	tokenInSection := fmt.Sprintf("**From Token**\n%s",
 		formatTokenInfo(
 			swap.TokenIn.Address.String(),
 			swap.AmountIn.Amount,
 			tokenInInfo,
 		))
 
+	tokenInSection += addMarketCapAndRisks(tokenInInfo)
+
 	// Add the token output section with information about the destination token
-	tokenOutSection := fmt.Sprintf("**To Token**\n%s\n\n",
+	tokenOutSection := fmt.Sprintf("**To Token**\n%s",
 		formatTokenInfo(
 			swap.TokenOut.Address.String(),
 			swap.AmountOut.Amount,
 			tokenOutInfo,
 		))
 
+	tokenOutSection += addMarketCapAndRisks(tokenOutInfo)
+
 	// Add transaction details including DEX information and timing
 	detailsSection := fmt.Sprintf("**Details**\n"+
-		"> 🏦 DEX: `%s`\n"+
-		"> 👛 Wallet: `%s`\n"+
-		"> ⏰ Time: `%s`",
+		"> 🏦 **DEX**: `%s`\n"+
+		"> 👛 **Wallet**: `%s`\n"+
+		"> ⏰ **Time**: `%s`",
 		swap.Program,
 		wallet.Address,
 		swap.Timestamp.Format("2006-01-02 15:04:05 MST"))
