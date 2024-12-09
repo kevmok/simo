@@ -1,6 +1,7 @@
 package discord
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -10,7 +11,7 @@ import (
 )
 
 type WebhookClient interface {
-	SendMessage(content string) error
+	SendMessage(ctx context.Context, content string) error
 }
 
 type DiscordWebhookClient struct {
@@ -48,7 +49,7 @@ func ParseWebhookURL(url string) (string, string, error) {
 }
 
 // SendMessage implements the message sending functionality
-func (c *DiscordWebhookClient) SendMessage(content string) error {
+func (c *DiscordWebhookClient) SendMessage(ctx context.Context, content string) error {
 	_, err := c.client.CreateMessage(discord.NewWebhookMessageCreateBuilder().SetContent(content).Build())
 	return err
 }

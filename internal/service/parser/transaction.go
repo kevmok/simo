@@ -4,191 +4,224 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"simo/internal/constants"
 	"strings"
+	"sync"
 	"time"
 
+	"simo/internal/constants"
+
+	"github.com/cenkalti/backoff/v4"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 )
 
-type TransactionParser struct {
-	client *rpc.Client
-	logger zerolog.Logger
+// TokenAmount represents a token amount with precise decimal handling
+type TokenAmount struct {
+	Amount   float64
+	Decimals uint8
+	Raw      uint64
 }
 
-type TokenTransaction struct {
-	WalletAddress string
-	TokenIn       string // Token address being swapped from
-	TokenOut      string // Token address being swapped to
-	AmountIn      float64
-	AmountOut     float64
-	Signature     string
-	Program       string // Which DEX program was used
+// TokenInfo contains essential token metadata
+type TokenInfo struct {
+	Address  solana.PublicKey
+	Symbol   string
+	Decimals uint8
 }
 
+type TokenBalance struct {
+	AccountIndex  uint16
+	Mint          solana.PublicKey
+	Owner         solana.PublicKey
+	UiTokenAmount rpc.UiTokenAmount
+}
+
+// SwapDetails contains comprehensive swap transaction information
 type SwapDetails struct {
-	TokenIn    solana.PublicKey
-	TokenOut   solana.PublicKey
-	AmountIn   uint64
-	AmountOut  uint64
-	DEXProgram string
+	TokenIn   TokenInfo
+	TokenOut  TokenInfo
+	AmountIn  TokenAmount
+	AmountOut TokenAmount
+	Signature string
+	Program   string // DEX program name (e.g., "Jupiter", "Raydium")
+	Timestamp time.Time
+}
+
+// ParserMetrics holds prometheus metrics for monitoring
+type ParserMetrics struct {
+	ParseDuration    *prometheus.HistogramVec
+	RetryCount       *prometheus.CounterVec
+	FailedParses     *prometheus.CounterVec
+	SuccessfulParses *prometheus.CounterVec
+}
+
+// TransactionParser handles the parsing of Solana transactions
+type TransactionParser struct {
+	client  *rpc.Client
+	logger  zerolog.Logger
+	metrics *ParserMetrics
+
+	// Caches
+	ataCache     sync.Map // Cache for Associated Token Accounts
+	programCache map[solana.PublicKey]string
 }
 
 const (
-	WrappedSOLMint = "So11111111111111111111111111111111111111112"
+	WrappedSOL = "So11111111111111111111111111111111111111112"
 )
 
 func NewTransactionParser(rpcURL string, logger zerolog.Logger) *TransactionParser {
 	return &TransactionParser{
-		client: rpc.New(rpcURL),
-		logger: logger.With().Str("component", "transaction_parser").Logger(),
+		client:  rpc.New(rpcURL),
+		logger:  logger.With().Str("component", "transaction_parser").Logger(),
+		metrics: initializeMetrics(),
+		programCache: map[solana.PublicKey]string{
+			constants.JupiterV6Program:     "Jupiter",
+			constants.RaydiumV4Program:     "Raydium",
+			constants.OrcaWhirlpoolProgram: "Orca",
+			constants.PumpfunProgram:       "Pumpfun",
+		},
 	}
 }
 
-func (p *TransactionParser) ParseTransaction(ctx context.Context, signature string, walletAddress string) (*TokenTransaction, error) {
-	p.logger.Info().
+func (p *TransactionParser) ParseTransaction(ctx context.Context, signature string, walletAddress string) (*SwapDetails, error) {
+	start := time.Now()
+	defer func() {
+		p.metrics.ParseDuration.WithLabelValues("parse_duration").Observe(time.Since(start).Seconds())
+	}()
+
+	p.logger.Debug().
 		Str("signature", signature).
 		Str("wallet", walletAddress).
-		Msg("Starting transaction parsing")
+		Msg("Starting transaction fetch")
 
 	tx, err := p.getTransactionWithRetry(ctx, signature)
-	if err != nil || tx == nil || tx.Meta == nil || tx.Meta.Err != nil {
-		return nil, fmt.Errorf("failed to get or invalid transaction: %w", err)
+	if err != nil {
+		p.metrics.FailedParses.WithLabelValues("get_transaction").Inc()
+		return nil, fmt.Errorf("failed to get transaction: %w", err)
 	}
+
+	p.logger.Debug().
+		Str("signature", signature).
+		Msg("Transaction fetched successfully")
 
 	parsed_tx, err := tx.Transaction.GetTransaction()
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse transaction: %w", err)
 	}
 
+	// Check if this is a DEX transaction
 	dexProgram := findDEXProgram(parsed_tx)
 	if dexProgram.IsZero() {
 		p.logger.Debug().Str("signature", signature).Msg("Not a DEX transaction")
 		return nil, nil
 	}
 
-	// Track all balance changes
+	// Calculate balance changes
 	changes := p.calculateBalanceChanges(tx, walletAddress)
-
-	// Special handling for SOL (both native and wrapped)
 	p.handleSOLChanges(tx, walletAddress, changes)
 
-	p.logger.Debug().
-		Interface("changes", changes).
-		Msg("Token balance changes calculated")
-
+	// Identify tokens and amounts
 	tokenIn, tokenOut, amountIn, amountOut := p.identifyTokens(changes)
 	if tokenIn == "" || tokenOut == "" {
-		p.logger.Debug().
-			Str("signature", signature).
-			Interface("changes", changes).
-			Msg("Insufficient token changes detected")
 		return nil, nil
 	}
 
-	return &TokenTransaction{
-		WalletAddress: walletAddress,
-		TokenIn:       tokenIn,
-		TokenOut:      tokenOut,
-		AmountIn:      math.Abs(amountIn),  // Ensure positive
-		AmountOut:     math.Abs(amountOut), // Ensure positive
-		Signature:     signature,
-		Program:       getProgramName(dexProgram),
+	return &SwapDetails{
+		TokenIn: TokenInfo{
+			Address: solana.MustPublicKeyFromBase58(tokenIn),
+		},
+		TokenOut: TokenInfo{
+			Address: solana.MustPublicKeyFromBase58(tokenOut),
+		},
+		AmountIn: TokenAmount{
+			Amount: math.Abs(amountIn),
+		},
+		AmountOut: TokenAmount{
+			Amount: math.Abs(amountOut),
+		},
+		Signature: signature,
+		Program:   p.programCache[dexProgram],
+		Timestamp: time.Unix(int64(*tx.BlockTime), 0),
 	}, nil
 }
 
 func (p *TransactionParser) getTransactionWithRetry(ctx context.Context, signature string) (*rpc.GetTransactionResult, error) {
 	var tx *rpc.GetTransactionResult
-	var err error
 
-	opts := &rpc.GetTransactionOpts{
-		MaxSupportedTransactionVersion: new(uint64),
-		Commitment:                     rpc.CommitmentConfirmed,
-	}
+	policy := backoff.NewExponentialBackOff()
+	policy.MaxElapsedTime = 30 * time.Second
+	policy.InitialInterval = 1 * time.Second
+	policy.MaxInterval = 5 * time.Second
+	policy.Multiplier = 1.5
 
-	maxRetries := 3
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		if attempt > 0 {
-			backoffDuration := time.Duration(math.Pow(2, float64(attempt))) * time.Second
-			time.Sleep(backoffDuration)
+	operation := func() error {
+		// Add context timeout for each attempt
+		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		opts := &rpc.GetTransactionOpts{
+			MaxSupportedTransactionVersion: new(uint64),
+			Commitment:                     rpc.CommitmentConfirmed,
 		}
 
-		tx, err = p.client.GetTransaction(ctx, solana.MustSignatureFromBase58(signature), opts)
-		if err == nil && tx != nil {
-			// Check both Meta.Err and Status.Err
-			if tx.Meta != nil && tx.Meta.Err == nil {
-				break
+		var err error
+		tx, err = p.client.GetTransaction(attemptCtx, solana.MustSignatureFromBase58(signature), opts)
+		if err != nil {
+			// More detailed error logging
+			p.logger.Debug().
+				Err(err).
+				Str("signature", signature).
+				Msg("Transaction fetch attempt failed")
+
+			if strings.Contains(err.Error(), "not found") {
+				return backoff.Permanent(fmt.Errorf("transaction not found: %w", err))
 			}
+
+			// Check for context cancellation
+			if attemptCtx.Err() != nil {
+				return backoff.Permanent(fmt.Errorf("context canceled during fetch: %w", attemptCtx.Err()))
+			}
+
+			return fmt.Errorf("transaction fetch failed: %w", err)
 		}
 
-		// Special handling for "not found"
-		if err != nil && strings.Contains(err.Error(), "not found") {
-			time.Sleep(time.Second)
-			continue
+		if tx == nil || tx.Meta == nil {
+			return fmt.Errorf("received empty transaction")
 		}
 
-		if attempt == maxRetries-1 {
-			return nil, fmt.Errorf("failed to get transaction after %d attempts: %w", maxRetries, err)
+		if tx.Meta.Err != nil {
+			return fmt.Errorf("transaction contains error: %v", tx.Meta.Err)
 		}
+
+		return nil
 	}
 
-	return tx, err
+	err := backoff.Retry(operation, backoff.WithContext(policy, ctx))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get transaction after retries: %w", err)
+	}
+
+	return tx, nil
 }
 
 func (p *TransactionParser) calculateBalanceChanges(tx *rpc.GetTransactionResult, walletAddress string) map[string]float64 {
 	changes := make(map[string]float64)
 	walletPubkey := solana.MustPublicKeyFromBase58(walletAddress)
 
-	// Create a map of pre-balances for quick lookup
+	// Process pre-balances
 	preBalances := make(map[string]float64)
 	for _, pre := range tx.Meta.PreTokenBalances {
 		if pre.UiTokenAmount.UiAmount != nil {
-			key := fmt.Sprintf("%d", pre.AccountIndex)
-			preBalances[key] = *pre.UiTokenAmount.UiAmount
+			preBalances[fmt.Sprintf("%d", pre.AccountIndex)] = *pre.UiTokenAmount.UiAmount
 		}
 	}
 
-	// Process post balances and calculate changes
+	// Process post-balances and calculate changes
 	for _, post := range tx.Meta.PostTokenBalances {
-		isRelevantAccount := false
-
-		// Check if direct ownership
-		if post.Owner.String() == walletAddress {
-			isRelevantAccount = true
-		} else {
-			// Check if it's an ATA
-			ata, _, _ := solana.FindAssociatedTokenAddress(walletPubkey, post.Mint)
-			// Get decoded transaction
-			decoded, err := tx.Transaction.GetTransaction()
-			if err != nil {
-				p.logger.Error().Err(err).Msg("Failed to decode transaction for ATA check")
-				continue
-			}
-
-			// Bounds check
-			if int(post.AccountIndex) >= len(decoded.Message.AccountKeys) {
-				p.logger.Error().
-					Uint16("accountIndex", post.AccountIndex).
-					Int("accountKeysLength", len(decoded.Message.AccountKeys)).
-					Msg("Account index out of bounds")
-				continue
-			}
-
-			accountKey := decoded.Message.AccountKeys[post.AccountIndex]
-			if ata.Equals(accountKey) {
-				isRelevantAccount = true
-			}
-		}
-
-		p.logger.Debug().
-			Str("mint", post.Mint.String()).
-			Str("owner", post.Owner.String()).
-			Bool("isRelevant", isRelevantAccount).
-			Msg("Checking account relevance")
-
-		if !isRelevantAccount {
+		if !p.isRelevantAccount(post, walletPubkey, tx) {
 			continue
 		}
 
@@ -197,10 +230,9 @@ func (p *TransactionParser) calculateBalanceChanges(tx *rpc.GetTransactionResult
 		}
 
 		postAmount := *post.UiTokenAmount.UiAmount
-		key := fmt.Sprintf("%d", post.AccountIndex)
-		preAmount := preBalances[key]
-
+		preAmount := preBalances[fmt.Sprintf("%d", post.AccountIndex)]
 		diff := postAmount - preAmount
+
 		if diff != 0 {
 			changes[post.Mint.String()] = diff
 		}
@@ -209,37 +241,48 @@ func (p *TransactionParser) calculateBalanceChanges(tx *rpc.GetTransactionResult
 	return changes
 }
 
+func (p *TransactionParser) isRelevantAccount(post rpc.TokenBalance, walletPubkey solana.PublicKey, tx *rpc.GetTransactionResult) bool {
+	if post.Owner != nil && post.Owner.String() == walletPubkey.String() {
+		return true
+	}
+
+	// Check ATA
+	ataKey := fmt.Sprintf("%s-%s", walletPubkey.String(), post.Mint.String())
+	if ata, ok := p.ataCache.Load(ataKey); ok {
+		return ata.(solana.PublicKey).Equals(*post.Owner)
+	}
+
+	ata, _, _ := solana.FindAssociatedTokenAddress(walletPubkey, post.Mint)
+	p.ataCache.Store(ataKey, ata)
+
+	return ata.Equals(*post.Owner)
+}
+
 func (p *TransactionParser) handleSOLChanges(tx *rpc.GetTransactionResult, walletAddress string, changes map[string]float64) {
-	// Handle native SOL balance changes
-	if len(tx.Meta.PreBalances) > 0 && len(tx.Meta.PostBalances) > 0 {
-		walletIndex := -1
-		// Get decoded transaction
-		decoded, err := tx.Transaction.GetTransaction()
-		if err != nil {
-			p.logger.Error().Err(err).Msg("Failed to decode transaction for SOL balance check")
-			return
-		}
+	if len(tx.Meta.PreBalances) == 0 || len(tx.Meta.PostBalances) == 0 {
+		return
+	}
 
-		for i, key := range decoded.Message.AccountKeys {
-			if key.String() == walletAddress {
-				walletIndex = i
-				break
-			}
-		}
+	decoded, err := tx.Transaction.GetTransaction()
+	if err != nil {
+		p.logger.Error().Err(err).Msg("Failed to decode transaction for SOL balance check")
+		return
+	}
 
-		if walletIndex >= 0 && walletIndex < len(tx.Meta.PreBalances) {
-			preBalance := float64(tx.Meta.PreBalances[walletIndex]) / 1e9 // Convert lamports to SOL
-			postBalance := float64(tx.Meta.PostBalances[walletIndex]) / 1e9
-
+	for i, key := range decoded.Message.AccountKeys {
+		if key.String() == walletAddress {
+			preBalance := float64(tx.Meta.PreBalances[i]) / 1e9
+			postBalance := float64(tx.Meta.PostBalances[i]) / 1e9
 			solChange := postBalance - preBalance
-			if math.Abs(solChange) > 0.00001 { // Filter out dust
-				// Add to wrapped SOL changes or create new entry
-				if existing, ok := changes[WrappedSOLMint]; ok {
-					changes[WrappedSOLMint] = existing + solChange
+
+			if math.Abs(solChange) > 0.00001 {
+				if existing, ok := changes[WrappedSOL]; ok {
+					changes[WrappedSOL] = existing + solChange
 				} else {
-					changes[WrappedSOLMint] = solChange
+					changes[WrappedSOL] = solChange
 				}
 			}
+			break
 		}
 	}
 }
@@ -248,32 +291,20 @@ func (p *TransactionParser) identifyTokens(changes map[string]float64) (string, 
 	var tokenIn, tokenOut string
 	var amountIn, amountOut float64
 
-	// Sort changes by absolute value to prioritize larger changes
 	for token, change := range changes {
 		p.logger.Debug().
 			Str("token", token).
 			Float64("change", change).
 			Msg("Processing token change")
 
-		if change < 0 {
-			if math.Abs(change) > math.Abs(amountIn) {
-				tokenIn = token
-				amountIn = change
-			}
-		} else {
-			if change > amountOut {
-				tokenOut = token
-				amountOut = change
-			}
+		if change < 0 && math.Abs(change) > math.Abs(amountIn) {
+			tokenIn = token
+			amountIn = change
+		} else if change > 0 && change > amountOut {
+			tokenOut = token
+			amountOut = change
 		}
 	}
-
-	p.logger.Debug().
-		Str("tokenIn", tokenIn).
-		Str("tokenOut", tokenOut).
-		Float64("amountIn", amountIn).
-		Float64("amountOut", amountOut).
-		Msg("Token identification complete")
 
 	return tokenIn, tokenOut, amountIn, amountOut
 }
@@ -286,6 +317,40 @@ func findDEXProgram(tx *solana.Transaction) solana.PublicKey {
 		}
 	}
 	return solana.PublicKey{}
+}
+
+// Initialize metrics
+func initializeMetrics() *ParserMetrics {
+	return &ParserMetrics{
+		ParseDuration: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name: "transaction_parse_duration_seconds",
+				Help: "Time spent parsing transactions",
+			},
+			[]string{"type"},
+		),
+		RetryCount: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "transaction_retry_total",
+				Help: "Number of transaction fetch retries",
+			},
+			[]string{"reason"},
+		),
+		FailedParses: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "transaction_parse_failures_total",
+				Help: "Number of failed transaction parses",
+			},
+			[]string{"reason"},
+		),
+		SuccessfulParses: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "transaction_parse_success_total",
+				Help: "Number of successful transaction parses",
+			},
+			[]string{"dex"},
+		),
+	}
 }
 
 func getProgramName(programID solana.PublicKey) string {

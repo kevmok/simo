@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"simo/internal/config"
 	"simo/internal/repository"
@@ -9,6 +10,7 @@ import (
 	"simo/internal/service/websocket"
 	"simo/pkg/discord"
 	"simo/pkg/solanatracker"
+	"strings"
 	"sync"
 	"time"
 
@@ -213,148 +215,285 @@ func (wt *WalletTracker) initializeWalletTracking(ctx context.Context) error {
 
 	return nil
 }
+
 func (wt *WalletTracker) startTrackingWallet(ctx context.Context, address string) error {
 	wt.logger.Info().
 		Str("wallet", address).
 		Msg("Starting to track wallet")
 
 	return wt.wsClient.SubscribeToWallet(ctx, address, func(signature string) {
-		wt.logger.Info().
-			Str("wallet", address).
-			Str("signature", signature).
-			Msg("New transaction detected")
+		// Create a new, independent context for transaction processing
+		// This ensures transaction processing isn't affected by the websocket context
+		processCtx := context.Background()
 
-		// Process transaction in a separate goroutine
+		// Add a timeout specific to transaction processing
+		processCtx, cancel := context.WithTimeout(processCtx, 60*time.Second)
+
 		go func() {
-			if err := wt.handleTransaction(ctx, address, signature); err != nil {
-				wt.logger.Error().
+			defer cancel() // Clean up the context when done
+
+			// Create a logger specific to this transaction
+			txLogger := wt.logger.With().
+				Str("wallet", address).
+				Str("signature", signature).
+				Str("operation", "transaction_processing").
+				Logger()
+
+			txLogger.Info().Msg("Processing new transaction")
+
+			if err := wt.handleTransaction(processCtx, address, signature); err != nil {
+				// Log error with transaction-specific context
+				txLogger.Error().
 					Err(err).
-					Str("wallet", address).
-					Str("signature", signature).
 					Msg("Failed to handle transaction")
 			}
 		}()
 	})
 }
 
+// In the tracker (handleTransaction), we'll create a proper context hierarchy:
 func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, signature string) error {
-	// Parse the transaction
-	tokenTx, err := wt.parser.ParseTransaction(ctx, signature, walletAddress)
+	// Create a root context for the entire operation with a reasonable timeout
+	rootCtx, rootCancel := context.WithTimeout(ctx, 90*time.Second)
+	defer rootCancel()
+
+	// Add transaction metadata to context for better tracing
+	rootCtx = context.WithValue(rootCtx, "wallet_address", walletAddress)
+	rootCtx = context.WithValue(rootCtx, "signature", signature)
+
+	// Create a logger with transaction context
+	txLogger := wt.logger.With().
+		Str("wallet", walletAddress).
+		Str("signature", signature).
+		Str("operation", "transaction_handling").
+		Logger()
+
+	// Let's break down the operation into phases with their own contexts
+	// Phase 1: Transaction Parsing
+	parseCtx, parseCancel := context.WithTimeout(rootCtx, 45*time.Second)
+	defer parseCancel()
+
+	txLogger.Debug().Msg("Starting transaction parsing phase")
+	swapDetails, err := wt.parser.ParseTransaction(parseCtx, signature, walletAddress)
 	if err != nil {
-		return fmt.Errorf("failed to parse transaction: %w", err)
-	}
-
-	// If it's not a token transaction we care about, ignore it
-	if tokenTx == nil {
-		wt.logger.Info().
-			Str("wallet", walletAddress).
-			Str("signature", signature).
-			Interface("tx", tokenTx).
-			Msg("Not a token transaction")
-		return nil
-	}
-
-	// Get wallet ID for database operations
-	wallet, err := wt.repo.GetWalletByAddress(ctx, walletAddress)
-	if err != nil {
-		return fmt.Errorf("failed to get wallet: %w", err)
-	}
-
-	tx := &repository.Transaction{
-		WalletID:  wallet.ID,
-		TokenIn:   tokenTx.TokenIn,
-		TokenOut:  tokenTx.TokenOut,
-		AmountIn:  tokenTx.AmountIn,
-		AmountOut: tokenTx.AmountOut,
-		Program:   tokenTx.Program,
-		Signature: tokenTx.Signature,
-		Timestamp: time.Now(),
-	}
-
-	if err := wt.repo.AddTransaction(ctx, tx); err != nil {
-		return fmt.Errorf("failed to record transaction: %w", err)
-	}
-
-	// Get token information for both tokens
-	tokenInInfo, err := wt.solTracker.GetTokenInfo(ctx, tokenTx.TokenIn)
-	if err != nil {
-		wt.logger.Warn().Err(err).Str("token", tokenTx.TokenIn).Msg("Failed to get token info")
-	}
-
-	tokenOutInfo, err := wt.solTracker.GetTokenInfo(ctx, tokenTx.TokenOut)
-	if err != nil {
-		wt.logger.Warn().Err(err).Str("token", tokenTx.TokenOut).Msg("Failed to get token info")
-	}
-	// log token in info and out info
-	wt.logger.Info().
-		Str("tokenIn", tokenInInfo.Token.Name).
-		Str("tokenInSymbol", tokenInInfo.Token.Symbol).
-		Str("tokenOut", tokenOutInfo.Token.Name).
-		Str("tokenOutSymbol", tokenOutInfo.Token.Symbol).
-		Msg("Token info retrieved")
-
-	var pnl *solanatracker.ProfitLoss
-	if tokenInInfo.Token.Mint != "So11111111111111111111111111111111111111112" {
-		pnl, err = wt.solTracker.GetProfitLoss(ctx, walletAddress, tokenInInfo.Token.Mint)
-		if err != nil {
-			wt.logger.Warn().Err(err).Str("token", tokenTx.TokenOut).Msg("Failed to get profit loss")
+		// Check for specific context errors
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			txLogger.Error().Msg("Transaction parsing timed out")
+			return fmt.Errorf("parsing timeout: %w", err)
+		case errors.Is(err, context.Canceled):
+			txLogger.Error().Msg("Transaction parsing was canceled")
+			return fmt.Errorf("parsing canceled: %w", err)
+		default:
+			txLogger.Error().Err(err).Msg("Transaction parsing failed")
+			return fmt.Errorf("parsing error: %w", err)
 		}
 	}
 
-	message := fmt.Sprintf("# 💱 New Swap Alert\n"+
-		"### [View Wallet](https://solana.fm/address/%s) | [View Transaction](https://solscan.io/tx/%s)\n\n"+
-		"**From Token**\n"+
-		"> %s (%s)\n"+
-		"> Amount: `%.6f %s`\n"+
-		"> Address: `%s`\n\n"+
-		"**To Token**\n"+
-		"> %s (%s)\n"+
-		"> Amount: `%.6f %s`\n"+
-		"> Address: `%s`\n\n"+
-		"**Details**\n"+
-		"> 🏦 DEX: `%s`\n"+
-		"> 👛 Wallet: `%s`",
-		wallet.Address, tokenTx.Signature,
-		tokenInInfo.Token.Name, tokenInInfo.Token.Symbol,
-		tokenTx.AmountIn, tokenInInfo.Token.Symbol,
-		tokenTx.TokenIn,
-		tokenOutInfo.Token.Name, tokenOutInfo.Token.Symbol,
-		tokenTx.AmountOut, tokenOutInfo.Token.Symbol,
-		tokenTx.TokenOut,
-		tokenTx.Program,
-		wallet.Address)
-
-	// Add PNL information only if available
-	if pnl != nil {
-		message += fmt.Sprintf("\n> 🤑 PNL Realized: `%.6f`\n> 💰 PNL Unrealized: `%.6f`",
-			pnl.Realized,
-			pnl.Unrealized)
+	// Early return if not a swap transaction
+	if swapDetails == nil {
+		txLogger.Info().Msg("Not a swap transaction")
+		return nil
 	}
 
-	wt.logger.Info().Msg("sending message to discord")
-	return wt.sendMessageToAllWebhooks(message)
+	// Phase 2: Database Operations
+	dbCtx, dbCancel := context.WithTimeout(rootCtx, 20*time.Second)
+	defer dbCancel()
+
+	txLogger.Debug().Msg("Starting database operations phase")
+	wallet, err := wt.repo.GetWalletByAddress(dbCtx, walletAddress)
+	if err != nil {
+		return fmt.Errorf("database error: %w", err)
+	}
+
+	// Phase 3: Token Information Retrieval
+	tokenCtx, tokenCancel := context.WithTimeout(rootCtx, 30*time.Second)
+	defer tokenCancel()
+
+	// Create wait group for parallel token info fetching
+	var tokenWg sync.WaitGroup
+	var tokenInInfo, tokenOutInfo *solanatracker.TokenInfo
+	var tokenInErr, tokenOutErr error
+
+	txLogger.Debug().Msg("Starting token information retrieval phase")
+	tokenWg.Add(2)
+	go func() {
+		defer tokenWg.Done()
+		tokenInInfo, tokenInErr = wt.solTracker.GetTokenInfo(tokenCtx, swapDetails.TokenIn.Address.String())
+	}()
+	go func() {
+		defer tokenWg.Done()
+		tokenOutInfo, tokenOutErr = wt.solTracker.GetTokenInfo(tokenCtx, swapDetails.TokenOut.Address.String())
+	}()
+
+	// Wait for token info with timeout
+	done := make(chan struct{})
+	go func() {
+		tokenWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Handle any errors from token info retrieval
+		if tokenInErr != nil {
+			txLogger.Warn().Err(tokenInErr).Msg("Failed to get token in info")
+		}
+		if tokenOutErr != nil {
+			txLogger.Warn().Err(tokenOutErr).Msg("Failed to get token out info")
+		}
+	case <-tokenCtx.Done():
+		txLogger.Warn().Msg("Token info retrieval timed out")
+		return fmt.Errorf("token info timeout: %w", tokenCtx.Err())
+	}
+
+	// Phase 4: Message Construction and Delivery
+	msgCtx, msgCancel := context.WithTimeout(rootCtx, 20*time.Second)
+	defer msgCancel()
+
+	txLogger.Debug().Msg("Starting message construction and delivery phase")
+
+	var pnl *solanatracker.ProfitLoss
+
+	// Add safety checks before attempting to get PNL
+	if tokenInInfo != nil && tokenInInfo.Token.Mint != "So11111111111111111111111111111111111111112" {
+		// Create a separate context for PNL retrieval with appropriate timeout
+		pnlCtx, pnlCancel := context.WithTimeout(ctx, 15*time.Second)
+		defer pnlCancel()
+
+		pnl, err = wt.solTracker.GetProfitLoss(pnlCtx, walletAddress, tokenInInfo.Token.Mint)
+		if err != nil {
+			txLogger.Warn().
+				Err(err).
+				Str("token", tokenInInfo.Token.Mint).
+				Msg("Failed to get profit loss")
+			// We continue execution since PNL is optional
+		}
+	}
+
+	message := constructDiscordMessage(wallet, swapDetails, tokenInInfo, tokenOutInfo, pnl)
+
+	if err := wt.sendMessageToAllWebhooks(msgCtx, message); err != nil {
+		txLogger.Error().Err(err).Msg("Failed to send Discord message")
+		return fmt.Errorf("message delivery error: %w", err)
+	}
+
+	txLogger.Info().Msg("Transaction handling completed successfully")
+	return nil
 }
 
-func (wt *WalletTracker) sendMessageToAllWebhooks(message string) error {
+func (wt *WalletTracker) sendMessageToAllWebhooks(ctx context.Context, message string) error {
 	var wg conc.WaitGroup
 	defer wg.Wait()
 	var errs []error
+	var errMu sync.Mutex // Mutex to safely collect errors from goroutines
 
 	for name, client := range wt.discords {
 		name, client := name, client // Create new variables for goroutine
 		wg.Go(func() {
-			if err := client.SendMessage(message); err != nil {
+			// Create a context with timeout for each webhook call
+			webhookCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+
+			// Send message with context
+			if err := client.SendMessage(webhookCtx, message); err != nil {
 				wt.logger.Error().
 					Err(err).
 					Str("webhook_name", name).
 					Msg("Failed to send message to webhook")
-				errs = append(errs, err)
+
+				errMu.Lock()
+				errs = append(errs, fmt.Errorf("webhook %s: %w", name, err))
+				errMu.Unlock()
 			}
 		})
 	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
 
 	if len(errs) > 0 {
 		return fmt.Errorf("failed to send message to some webhooks: %v", errs)
 	}
 	return nil
+}
+
+// constructDiscordMessage creates a formatted Discord message for swap transactions.
+// It handles cases where token information might be missing and includes optional PNL data.
+func constructDiscordMessage(
+	wallet *repository.Wallet,
+	swap *parser.SwapDetails,
+	tokenInInfo *solanatracker.TokenInfo,
+	tokenOutInfo *solanatracker.TokenInfo,
+	pnl *solanatracker.ProfitLoss,
+) string {
+	// Helper function to format token details, providing consistent formatting
+	// even when token information is unavailable
+	formatTokenInfo := func(mint string, amount float64, info *solanatracker.TokenInfo) string {
+		if info == nil {
+			return fmt.Sprintf("> Unknown Token\n"+
+				"> Amount: `%.6f`\n"+
+				"> Address: `%s`", amount, mint)
+		}
+
+		return fmt.Sprintf("> %s (%s)\n"+
+			"> Amount: `%.6f %s`\n"+
+			"> Address: `%s`",
+			info.Token.Name,
+			info.Token.Symbol,
+			amount,
+			info.Token.Symbol,
+			mint)
+	}
+
+	// Construct the message by building each section
+	// Start with the header containing links to blockchain explorers
+	header := fmt.Sprintf("# 💱 New Swap Alert\n"+
+		"### [View Wallet](https://solana.fm/address/%s) | [View Transaction](https://solscan.io/tx/%s)\n\n",
+		wallet.Address, swap.Signature)
+
+	// Add the token input section with detailed information about the source token
+	tokenInSection := fmt.Sprintf("**From Token**\n%s\n\n",
+		formatTokenInfo(
+			swap.TokenIn.Address.String(),
+			swap.AmountIn.Amount,
+			tokenInInfo,
+		))
+
+	// Add the token output section with information about the destination token
+	tokenOutSection := fmt.Sprintf("**To Token**\n%s\n\n",
+		formatTokenInfo(
+			swap.TokenOut.Address.String(),
+			swap.AmountOut.Amount,
+			tokenOutInfo,
+		))
+
+	// Add transaction details including DEX information and timing
+	detailsSection := fmt.Sprintf("**Details**\n"+
+		"> 🏦 DEX: `%s`\n"+
+		"> 👛 Wallet: `%s`\n"+
+		"> ⏰ Time: `%s`",
+		swap.Program,
+		wallet.Address,
+		swap.Timestamp.Format("2006-01-02 15:04:05 MST"))
+
+	// Add PNL information if available and if the input token isn't wrapped SOL
+	// We check both the PNL data and the token type to ensure relevant PNL reporting
+	if pnl != nil && tokenInInfo != nil &&
+		tokenInInfo.Token.Mint != "So11111111111111111111111111111111111111112" {
+		detailsSection += fmt.Sprintf("\n> 🤑 PNL Realized: `%.6f`\n"+
+			"> 💰 PNL Unrealized: `%.6f`",
+			pnl.Realized,
+			pnl.Unrealized)
+	}
+
+	// Combine all sections into the final message
+	message := strings.Join([]string{
+		header,
+		tokenInSection,
+		tokenOutSection,
+		detailsSection,
+	}, "")
+
+	return message
 }

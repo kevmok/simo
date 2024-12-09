@@ -507,35 +507,28 @@ func (c *Client) processMessages(ctx context.Context) error {
 }
 
 func (c *Client) processBatch(ctx context.Context, msg *Message) error {
-	var subs []*Subscription
-	c.subscriptions.Range(func(key, value interface{}) bool {
-		if sub, ok := value.(*Subscription); ok {
-			subs = append(subs, sub)
-		}
-		return true
-	})
+	// Look up only the specific subscription for this message
+	value, exists := c.subscriptions.Load(msg.Address)
+	if !exists {
+		c.logger.Debug().
+			Str("address", msg.Address).
+			Msg("No subscription found for address")
+		return nil
+	}
 
-	// Create a batch pool with configured size
-	p := pool.New().
-		WithContext(ctx).
-		WithMaxGoroutines(c.config.BatchSize).
-		WithCancelOnError()
+	sub, ok := value.(*Subscription)
+	if !ok {
+		return fmt.Errorf("invalid subscription type for address: %s", msg.Address)
+	}
 
-	// Process subscriptions in parallel
-	iter.ForEach(subs, func(sub **Subscription) {
-		p.Go(func(ctx context.Context) error {
-			return c.handleSubscriptionMessage(ctx, *sub, msg)
-		})
-	})
+	// Create a context with timeout for the operation
+	msgCtx, cancel := context.WithTimeout(ctx, c.config.ReadTimeout)
+	defer cancel()
 
-	return p.Wait()
+	return c.handleSubscriptionMessage(msgCtx, sub, msg)
 }
 
 func (c *Client) handleSubscriptionMessage(ctx context.Context, sub *Subscription, msg *Message) error {
-	// Add timeouts for operations
-	ctx, cancel := context.WithTimeout(ctx, c.config.ReadTimeout)
-	defer cancel()
-
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -544,7 +537,11 @@ func (c *Client) handleSubscriptionMessage(ctx context.Context, sub *Subscriptio
 			return fmt.Errorf("rate limit exceeded: %w", err)
 		}
 
-		// Process the message for this subscription
+		// Additional validation to ensure we're processing the right message
+		if sub.Address != msg.Address {
+			return fmt.Errorf("address mismatch: expected %s, got %s", sub.Address, msg.Address)
+		}
+
 		sub.Callback(msg.Payload.(string))
 		return nil
 	}
