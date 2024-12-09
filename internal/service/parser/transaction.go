@@ -115,19 +115,48 @@ func (p *TransactionParser) ParseTransaction(ctx context.Context, signature stri
 	// Check if this is a DEX transaction
 	dexProgram := findDEXProgram(parsed_tx)
 	if dexProgram.IsZero() {
-		p.logger.Debug().Str("signature", signature).Msg("Not a DEX transaction")
+		// Log all program IDs for debugging
+		var programIDs []string
+		for _, inst := range parsed_tx.Message.Instructions {
+			programID := parsed_tx.Message.AccountKeys[inst.ProgramIDIndex]
+			programIDs = append(programIDs, programID.String())
+		}
+
+		p.logger.Debug().
+			Strs("program_ids", programIDs).
+			Msg("Not a DEX transaction - no matching DEX program found")
 		return nil, nil
 	}
 
 	// Calculate balance changes
 	changes := p.calculateBalanceChanges(tx, walletAddress)
+
+	// Log all changes for debugging
+	for token, change := range changes {
+		p.logger.Debug().
+			Str("token", token).
+			Float64("change", change).
+			Msg("Token balance change detected")
+	}
+
 	p.handleSOLChanges(tx, walletAddress, changes)
 
 	// Identify tokens and amounts
 	tokenIn, tokenOut, amountIn, amountOut := p.identifyTokens(changes)
+
+	p.logger.Debug().
+		Str("token_in", tokenIn).
+		Str("token_out", tokenOut).
+		Float64("amount_in", amountIn).
+		Float64("amount_out", amountOut).
+		Int("total_changes", len(changes)).
+		Msg("Token identification results")
+
 	if tokenIn == "" || tokenOut == "" {
 		return nil, nil
 	}
+
+	p.metrics.SuccessfulParses.WithLabelValues(p.programCache[dexProgram]).Inc()
 
 	return &SwapDetails{
 		TokenIn: TokenInfo{
@@ -291,19 +320,62 @@ func (p *TransactionParser) identifyTokens(changes map[string]float64) (string, 
 	var tokenIn, tokenOut string
 	var amountIn, amountOut float64
 
-	for token, change := range changes {
-		p.logger.Debug().
-			Str("token", token).
-			Float64("change", change).
-			Msg("Processing token change")
+	// Track all negative and positive changes for better analysis
+	var negativeChanges, positiveChanges []struct {
+		token  string
+		amount float64
+	}
 
-		if change < 0 && math.Abs(change) > math.Abs(amountIn) {
-			tokenIn = token
-			amountIn = change
-		} else if change > 0 && change > amountOut {
-			tokenOut = token
-			amountOut = change
+	// First pass: separate changes into negative and positive
+	for token, change := range changes {
+		if change < 0 {
+			negativeChanges = append(negativeChanges, struct {
+				token  string
+				amount float64
+			}{token, change})
+		} else if change > 0 {
+			positiveChanges = append(positiveChanges, struct {
+				token  string
+				amount float64
+			}{token, change})
 		}
+	}
+
+	// Log summary of changes
+	p.logger.Debug().
+		Int("negative_changes", len(negativeChanges)).
+		Int("positive_changes", len(positiveChanges)).
+		Msg("Analyzing token changes")
+
+	// Find largest negative change (token in)
+	for _, nc := range negativeChanges {
+		if math.Abs(nc.amount) > math.Abs(amountIn) {
+			tokenIn = nc.token
+			amountIn = nc.amount
+		}
+	}
+
+	// Find largest positive change (token out)
+	for _, pc := range positiveChanges {
+		if pc.amount > amountOut {
+			tokenOut = pc.token
+			amountOut = pc.amount
+		}
+	}
+
+	// Validate the swap makes sense
+	if tokenIn != "" && tokenOut != "" {
+		p.logger.Debug().
+			Str("token_in", tokenIn).
+			Float64("amount_in", amountIn).
+			Str("token_out", tokenOut).
+			Float64("amount_out", amountOut).
+			Msg("Valid swap pair identified")
+	} else {
+		p.logger.Debug().
+			Interface("negative_changes", negativeChanges).
+			Interface("positive_changes", positiveChanges).
+			Msg("Failed to identify valid swap pair")
 	}
 
 	return tokenIn, tokenOut, amountIn, amountOut

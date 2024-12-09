@@ -275,6 +275,7 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 
 	txLogger.Debug().Msg("Starting transaction parsing phase")
 	swapDetails, err := wt.parser.ParseTransaction(parseCtx, signature, walletAddress)
+
 	if err != nil {
 		// Check for specific context errors
 		switch {
