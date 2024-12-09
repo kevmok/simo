@@ -273,13 +273,34 @@ func (c *Client) connect() error {
 }
 
 func (c *Client) SubscribeToWallet(ctx context.Context, address string, callback func(string)) error {
+	if c.client == nil {
+		c.logger.Error().Msg("Cannot subscribe: websocket client is nil")
+		return fmt.Errorf("websocket client not initialized")
+	}
+
+	c.logger.Info().
+		Str("address", address).
+		Msg("Starting wallet subscription")
+
 	pubkey := solana.MustPublicKeyFromBase58(address)
 
 	// Execute subscription through circuit breaker
 	err := c.circuitBreaker.Run(func() error {
+		if c.client == nil {
+			return fmt.Errorf("websocket client is nil")
+		}
+
 		sub, err := c.client.LogsSubscribeMentions(pubkey, rpc.CommitmentConfirmed)
 		if err != nil {
+			c.logger.Error().
+				Err(err).
+				Str("address", address).
+				Msg("Subscription failed")
 			return fmt.Errorf("subscription failed: %w", err)
+		}
+
+		if sub == nil {
+			return fmt.Errorf("received nil subscription")
 		}
 
 		subscription := &Subscription{
@@ -341,55 +362,141 @@ func (c *Client) SubscribeToWallet(ctx context.Context, address string, callback
 		return nil
 	})
 
-	return err
+	if err != nil {
+		c.logger.Error().
+			Err(err).
+			Str("address", address).
+			Msg("Wallet subscription failed")
+		return fmt.Errorf("wallet subscription failed: %w", err)
+	}
+
+	c.logger.Info().
+		Str("address", address).
+		Msg("Wallet subscription completed successfully")
+
+	return nil
 }
 
 func (c *Client) reconnect() error {
+	c.logger.Info().Msg("Starting reconnection process")
+
 	// Clean up old client
 	if c.client != nil {
-		c.logger.Debug().Msg("closing old connection")
+		c.logger.Debug().Msg("Closing old connection")
 		c.client.Close()
 		c.client = nil
+		c.logger.Debug().Msg("Old connection closed successfully")
+	} else {
+		c.logger.Debug().Msg("No existing client to close")
 	}
 	c.connected = false
 
-	// Clean up old subscriptions
+	// Track subscription count for logging
+	var subCount int
+	// Clean up old subscriptions with logging
 	c.subscriptions.Range(func(key, value interface{}) bool {
-		if sub, ok := value.(*Subscription); ok && sub.Sub != nil {
-			sub.Sub.Unsubscribe()
-			sub.Sub = nil
+		if sub, ok := value.(*Subscription); ok {
+			if sub.Sub != nil {
+				c.logger.Debug().
+					Str("address", sub.Address).
+					Msg("Unsubscribing wallet during reconnection")
+				sub.Sub.Unsubscribe()
+				sub.Sub = nil
+				subCount++
+			}
+		}
+		return true
+	})
+	c.logger.Debug().
+		Int("subscription_count", subCount).
+		Msg("Cleaned up existing subscriptions")
+
+	// Try to reconnect with timeout context
+	c.logger.Info().Msg("Attempting to establish new connection")
+	if err := c.connect(); err != nil {
+		c.logger.Error().
+			Err(err).
+			Msg("Failed to establish new connection")
+		return fmt.Errorf("reconnection failed: %w", err)
+	}
+	c.logger.Info().Msg("Successfully established new connection")
+
+	// Get current subscriptions for resubscription
+	var subs []*Subscription
+	c.subscriptions.Range(func(key, value interface{}) bool {
+		if sub, ok := value.(*Subscription); ok {
+			subs = append(subs, sub)
 		}
 		return true
 	})
 
-	// Try to reconnect
-	if err := c.connect(); err != nil {
-		return err
+	c.logger.Info().
+		Int("subscription_count", len(subs)).
+		Msg("Starting resubscription process")
+
+	// Resubscribe all with error tracking
+	var resubErrors []error
+	for _, sub := range subs {
+		c.logger.Debug().
+			Str("address", sub.Address).
+			Msg("Attempting to resubscribe wallet")
+
+		if err := c.resubscribe(sub); err != nil {
+			c.logger.Error().
+				Err(err).
+				Str("address", sub.Address).
+				Msg("Failed to resubscribe wallet")
+			resubErrors = append(resubErrors, fmt.Errorf("failed to resubscribe %s: %w", sub.Address, err))
+		} else {
+			c.logger.Debug().
+				Str("address", sub.Address).
+				Msg("Successfully resubscribed wallet")
+		}
 	}
 
-	// Resubscribe all
-	var resubError error
-	c.subscriptions.Range(func(key, value interface{}) bool {
-		sub := value.(*Subscription)
-		if err := c.resubscribe(sub); err != nil {
-			resubError = err
-			return false
-		}
-		return true
-	})
+	if len(resubErrors) > 0 {
+		// Combine all resubscription errors
+		return fmt.Errorf("reconnection completed with resubscription errors: %v", resubErrors)
+	}
 
-	return resubError
+	c.logger.Info().Msg("Reconnection process completed successfully")
+	return nil
 }
 
 func (c *Client) resubscribe(sub *Subscription) error {
+	if sub == nil {
+		return fmt.Errorf("cannot resubscribe nil subscription")
+	}
+
+	c.logger.Debug().
+		Str("address", sub.Address).
+		Msg("Attempting resubscription")
+
 	pubkey := solana.MustPublicKeyFromBase58(sub.Address)
+
+	// Add timeout context for subscription
+	_, cancel := context.WithTimeout(c.ctx, c.config.ConnTimeout)
+	defer cancel()
 
 	newSub, err := c.client.LogsSubscribeMentions(pubkey, rpc.CommitmentConfirmed)
 	if err != nil {
 		return fmt.Errorf("resubscription failed: %w", err)
 	}
 
+	if newSub == nil {
+		return fmt.Errorf("received nil subscription")
+	}
+
+	// Clean up old subscription if it exists
+	if sub.Sub != nil {
+		sub.Sub.Unsubscribe()
+	}
+
 	sub.Sub = newSub
+	c.logger.Debug().
+		Str("address", sub.Address).
+		Msg("Resubscription successful")
+
 	return nil
 }
 
