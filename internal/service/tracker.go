@@ -439,12 +439,12 @@ func constructDiscordMessage(
 
 		return fmt.Sprintf("> %s (%s)\n"+
 			"> **Amount**: `%.6f %s`\n"+
-			"> **Address**: `%s`\n",
+			"> **Address**: [%s](https://ape.pro/solana/%s)\n",
 			info.Token.Name,
 			info.Token.Symbol,
 			amount,
 			info.Token.Symbol,
-			mint)
+			mint, mint)
 	}
 
 	addMarketCapAndRisks := func(info *solanatracker.TokenInfo) string {
