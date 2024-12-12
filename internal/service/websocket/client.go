@@ -314,6 +314,9 @@ func (c *Client) SubscribeToWallet(ctx context.Context, address string, callback
 		// Send messages to the processing queue
 		c.pool.Go(func(ctx context.Context) error {
 			defer func() {
+				c.logger.Debug().
+					Str("address", address).
+					Msg("Cleaning up subscription")
 				if sub != nil {
 					subscription.Sub.Unsubscribe()
 				}
@@ -323,9 +326,16 @@ func (c *Client) SubscribeToWallet(ctx context.Context, address string, callback
 			for {
 				select {
 				case <-ctx.Done():
+					c.logger.Debug().
+						Str("address", address).
+						Msg("Subscription context canceled")
 					return ctx.Err()
 				default:
 					if err := c.limiter.Wait(ctx); err != nil {
+						c.logger.Debug().
+							Str("address", address).
+							Err(err).
+							Msg("Rate limit exceeded")
 						return err
 					}
 
@@ -335,9 +345,19 @@ func (c *Client) SubscribeToWallet(ctx context.Context, address string, callback
 						for attempt := 0; attempt < c.config.MaxRetries; attempt++ {
 							if err := c.checkAndReconnect(); err != nil {
 								backoff := exponentialBackoff(attempt, c.config.BackoffMin, c.config.BackoffMax)
+								c.logger.Debug().
+									Str("address", address).
+									Err(err).
+									Int("attempt", attempt).
+									Dur("backoff", backoff).
+									Msg("Reconnection attempt failed, waiting before retry")
 								time.Sleep(backoff)
 								continue
 							}
+							c.logger.Info().
+								Str("address", address).
+								Int("attempt", attempt).
+								Msg("Reconnection successful")
 							break
 						}
 						continue
@@ -351,8 +371,16 @@ func (c *Client) SubscribeToWallet(ctx context.Context, address string, callback
 							Payload:    got.Value.Signature.String(),
 							ReceivedAt: time.Now(),
 						}:
+							c.logger.Debug().
+								Str("address", address).
+								Str("signature", got.Value.Signature.String()).
+								Msg("Message queued for processing")
 						default:
 							c.logger.Warn().Msg("message queue full, dropping message")
+							c.logger.Warn().
+								Str("address", address).
+								Str("signature", got.Value.Signature.String()).
+								Msg("Message queue full, dropping message")
 						}
 					}
 				}
@@ -463,6 +491,7 @@ func (c *Client) reconnect() error {
 	return nil
 }
 
+// Improve the resubscribe function too
 func (c *Client) resubscribe(sub *Subscription) error {
 	if sub == nil {
 		return fmt.Errorf("cannot resubscribe nil subscription")
