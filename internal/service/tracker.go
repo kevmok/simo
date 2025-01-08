@@ -32,7 +32,7 @@ type WalletTracker struct {
 	db         *pgxpool.Pool
 	repo       repository.Repository
 	discords   map[string]discord.WebhookClient
-	wsClient   *websocket.Client
+	wsClient   *websocket.WSClient
 	solTracker *solanatracker.Client
 	parser     *parser.TransactionParser
 	logger     zerolog.Logger
@@ -58,7 +58,7 @@ func NewWalletTracker(ctx context.Context, cfg Config, logger zerolog.Logger) (*
 
 	wsCfg := websocket.DefaultConfig()
 	wsCfg.WSURL = cfg.SolanaWebSocketURL
-	wsCfg.RPCURL = cfg.SolanaRPCURL
+	// wsCfg.RPCURL = cfg.SolanaRPCURL
 	wsClient, err := websocket.NewClient(wsCfg, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create WebSocket client: %w", err)
@@ -221,7 +221,7 @@ func (wt *WalletTracker) startTrackingWallet(ctx context.Context, address string
 		Str("wallet", address).
 		Msg("Starting to track wallet")
 
-	return wt.wsClient.SubscribeToWallet(ctx, address, func(signature string) {
+	return wt.wsClient.SubscribeToWallet(ctx, address, func(txInfo websocket.TransactionInfo) {
 		// Create a new, independent context for transaction processing
 		// This ensures transaction processing isn't affected by the websocket context
 		processCtx := context.Background()
@@ -235,13 +235,13 @@ func (wt *WalletTracker) startTrackingWallet(ctx context.Context, address string
 			// Create a logger specific to this transaction
 			txLogger := wt.logger.With().
 				Str("wallet", address).
-				Str("signature", signature).
+				Str("signature", txInfo.Signature).
 				Str("operation", "transaction_processing").
 				Logger()
 
 			txLogger.Info().Msg("Processing new transaction")
 
-			if err := wt.handleTransaction(processCtx, address, signature); err != nil {
+			if err := wt.handleTransaction(processCtx, address, txInfo.Signature); err != nil {
 				// Log error with transaction-specific context
 				txLogger.Error().
 					Err(err).
