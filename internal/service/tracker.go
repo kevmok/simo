@@ -190,6 +190,10 @@ func (wt *WalletTracker) GetWallets(ctx context.Context) ([]repository.Wallet, e
 	return wt.repo.GetWallets(ctx)
 }
 
+func (wt *WalletTracker) GetRepository() repository.Repository {
+	return wt.repo
+}
+
 func (wt *WalletTracker) GetWalletPositions(ctx context.Context, address string) ([]repository.TokenPosition, error) {
 	wallet, err := wt.repo.GetWalletByAddress(ctx, address)
 	if err != nil {

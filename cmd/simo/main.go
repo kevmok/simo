@@ -145,8 +145,10 @@ func initializeComponents(ctx context.Context, config service.Config, logger *ze
 		return nil, fmt.Errorf("failed to initialize wallet tracker: %w", err)
 	}
 
+	walletManager := service.NewWalletManager(tracker.GetRepository(), *logger)
+
 	// Initialize handler and server
-	handler := handler.NewHandler(tracker, *logger)
+	handler := handler.NewHandler(tracker, walletManager, *logger)
 	srv := server.NewServer(server.Config{
 		Port:            "8080",
 		ShutdownTimeout: 30 * time.Second,
