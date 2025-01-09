@@ -13,6 +13,8 @@ var (
 	ErrWalletNotFound      = errors.New("wallet not found")
 	ErrTokenPositionEmpty  = errors.New("token position is empty")
 	ErrTransactionNotFound = errors.New("transaction not found")
+	ErrAliasNotFound       = errors.New("wallet alias not found")
+	ErrDuplicateAlias      = errors.New("alias already exists for this wallet")
 )
 
 type Wallet struct {
@@ -53,6 +55,14 @@ type Webhook struct {
 	UpdatedAt  time.Time `db:"updated_at"`
 }
 
+type WalletAlias struct {
+	ID        int       `db:"id"`
+	WalletID  int       `db:"wallet_id"`
+	Alias     string    `db:"alias"`
+	CreatedAt time.Time `db:"created_at"`
+	UpdatedAt time.Time `db:"updated_at"`
+}
+
 type Repository interface {
 	// Wallet operations
 	AddWallet(ctx context.Context, address string) error
@@ -73,6 +83,12 @@ type Repository interface {
 	GetWebhooks(ctx context.Context) ([]Webhook, error)
 	AddWebhook(ctx context.Context, name, url string) error
 	RemoveWebhook(ctx context.Context, id int) error
+
+	// Wallet alias operations
+	AddWalletAlias(ctx context.Context, walletID int, alias string) error
+	RemoveWalletAlias(ctx context.Context, walletID int, alias string) error
+	GetWalletAliases(ctx context.Context, walletID int) ([]WalletAlias, error)
+	GetWalletByAlias(ctx context.Context, alias string) (*Wallet, error)
 }
 
 type PostgresRepository struct {
@@ -285,4 +301,58 @@ func (r *PostgresRepository) RemoveWebhook(ctx context.Context, id int) error {
 	query := `DELETE FROM webhooks WHERE id = $1`
 	_, err := r.db.Exec(ctx, query, id)
 	return err
+}
+
+// Wallet alias operations
+func (r *PostgresRepository) AddWalletAlias(ctx context.Context, walletID int, alias string) error {
+	query := `
+        INSERT INTO wallet_aliases (wallet_id, alias)
+        VALUES ($1, $2)
+        ON CONFLICT (wallet_id, alias) DO NOTHING
+        RETURNING id`
+
+	var id int
+	err := pgxscan.Get(ctx, r.db, &id, query, walletID, alias)
+	if err != nil {
+		return ErrDuplicateAlias
+	}
+	return nil
+}
+
+func (r *PostgresRepository) RemoveWalletAlias(ctx context.Context, walletID int, alias string) error {
+	query := `DELETE FROM wallet_aliases WHERE wallet_id = $1 AND alias = $2`
+	result, err := r.db.Exec(ctx, query, walletID, alias)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		return ErrAliasNotFound
+	}
+	return nil
+}
+
+func (r *PostgresRepository) GetWalletAliases(ctx context.Context, walletID int) ([]WalletAlias, error) {
+	var aliases []WalletAlias
+	query := `
+        SELECT * FROM wallet_aliases
+        WHERE wallet_id = $1
+        ORDER BY created_at DESC`
+
+	if err := pgxscan.Select(ctx, r.db, &aliases, query, walletID); err != nil {
+		return nil, err
+	}
+	return aliases, nil
+}
+
+func (r *PostgresRepository) GetWalletByAlias(ctx context.Context, alias string) (*Wallet, error) {
+	var wallet Wallet
+	query := `
+        SELECT w.* FROM wallets w
+        INNER JOIN wallet_aliases wa ON wa.wallet_id = w.id
+        WHERE wa.alias = $1`
+
+	if err := pgxscan.Get(ctx, r.db, &wallet, query, alias); err != nil {
+		return nil, ErrWalletNotFound
+	}
+	return &wallet, nil
 }

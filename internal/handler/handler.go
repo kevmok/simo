@@ -12,12 +12,14 @@ import (
 
 type Handler struct {
 	tracker service.WalletTrackerService
+	wallet  service.WalletService
 	logger  zerolog.Logger
 }
 
-func NewHandler(tracker service.WalletTrackerService, logger zerolog.Logger) *Handler {
+func NewHandler(tracker service.WalletTrackerService, wallet service.WalletService, logger zerolog.Logger) *Handler {
 	return &Handler{
 		tracker: tracker,
+		wallet:  wallet,
 		logger:  logger,
 	}
 }
@@ -35,9 +37,23 @@ type WalletsResponse struct {
 	Wallets []WalletResponse `json:"wallets"`
 }
 
+type WalletAliasResponse struct {
+	ID       int    `json:"id"`
+	WalletID int    `json:"wallet_id"`
+	Alias    string `json:"alias"`
+}
+
+type WalletAliasesResponse struct {
+	Aliases []WalletAliasResponse `json:"aliases"`
+}
+
 // Request structs
 type AddWalletRequest struct {
 	Address string `json:"address"`
+}
+
+type AddWalletAliasRequest struct {
+	Alias string `json:"alias"`
 }
 
 // Utility methods
@@ -104,4 +120,100 @@ func (h *Handler) RemoveWallet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.respondWithJSON(w, http.StatusOK, WalletResponse{Address: address})
+}
+
+// Wallet alias handlers
+func (h *Handler) AddWalletAlias(w http.ResponseWriter, r *http.Request) {
+	address := chi.URLParam(r, "address")
+	if address == "" {
+		h.respondWithError(w, http.StatusBadRequest, errors.New("address is required"))
+		return
+	}
+
+	var req AddWalletAliasRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, errors.New("invalid request body"))
+		return
+	}
+
+	if req.Alias == "" {
+		h.respondWithError(w, http.StatusBadRequest, errors.New("alias is required"))
+		return
+	}
+
+	alias, err := h.wallet.AddWalletAlias(r.Context(), address, req.Alias)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, WalletAliasResponse{
+		ID:       alias.ID,
+		WalletID: alias.WalletID,
+		Alias:    alias.Alias,
+	})
+}
+
+func (h *Handler) RemoveWalletAlias(w http.ResponseWriter, r *http.Request) {
+	address := chi.URLParam(r, "address")
+	if address == "" {
+		h.respondWithError(w, http.StatusBadRequest, errors.New("address is required"))
+		return
+	}
+
+	alias := chi.URLParam(r, "alias")
+	if alias == "" {
+		h.respondWithError(w, http.StatusBadRequest, errors.New("alias is required"))
+		return
+	}
+
+	if err := h.wallet.RemoveWalletAlias(r.Context(), address, alias); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, struct{}{})
+}
+
+func (h *Handler) ListWalletAliases(w http.ResponseWriter, r *http.Request) {
+	address := chi.URLParam(r, "address")
+	if address == "" {
+		h.respondWithError(w, http.StatusBadRequest, errors.New("address is required"))
+		return
+	}
+
+	aliases, err := h.wallet.GetWalletAliases(r.Context(), address)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	response := WalletAliasesResponse{
+		Aliases: make([]WalletAliasResponse, len(aliases)),
+	}
+	for i, alias := range aliases {
+		response.Aliases[i] = WalletAliasResponse{
+			ID:       alias.ID,
+			WalletID: alias.WalletID,
+			Alias:    alias.Alias,
+		}
+	}
+
+	h.respondWithJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) GetWalletByAlias(w http.ResponseWriter, r *http.Request) {
+	alias := chi.URLParam(r, "alias")
+	if alias == "" {
+		h.respondWithError(w, http.StatusBadRequest, errors.New("alias is required"))
+		return
+	}
+
+	wallet, err := h.wallet.GetWalletByAlias(r.Context(), alias)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, WalletResponse{Address: wallet.Address})
 }
