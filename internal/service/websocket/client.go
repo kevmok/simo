@@ -61,6 +61,7 @@ type Subscription struct {
 	callback   func(TransactionInfo)
 	sub        *ws.LogSubscription
 	commitment rpc.CommitmentType
+	cancel     context.CancelFunc
 }
 
 // DefaultConfig returns a Config with sensible default values
@@ -179,17 +180,21 @@ func (c *WSClient) SubscribeToWallet(ctx context.Context, address string, callba
 			return nil, fmt.Errorf("failed to subscribe: %w", err)
 		}
 
+		// Create a cancellable context for this subscription
+		subCtx, cancel := context.WithCancel(context.Background())
+
 		c.subscriptionsMu.Lock()
 		c.subscriptions[address] = &Subscription{
 			callback:   callback,
 			sub:        sub,
 			commitment: rpc.CommitmentConfirmed,
+			cancel:     cancel,
 		}
 		c.subscriptionsMu.Unlock()
 
 		// Start subscription handler
 		c.wg.Go(func() {
-			c.handleSubscription(address, sub)
+			c.handleSubscription(subCtx, address, sub)
 		})
 
 		return nil, nil
@@ -198,7 +203,7 @@ func (c *WSClient) SubscribeToWallet(ctx context.Context, address string, callba
 	return err
 }
 
-func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
+func (c *WSClient) handleSubscription(ctx context.Context, address string, sub *ws.LogSubscription) {
 	defer func() {
 		c.subscriptionsMu.Lock()
 		delete(c.subscriptions, address)
@@ -207,11 +212,20 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-c.done:
 			return
 		default:
-			notification, err := sub.Recv(context.Background())
+			recvCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			notification, err := sub.Recv(recvCtx)
+			cancel()
+
 			if err != nil {
+				if ctx.Err() != nil {
+					// Context was cancelled, exit cleanly
+					return
+				}
 				c.logger.Error().
 					Err(err).
 					Str("wallet", address).
@@ -257,8 +271,15 @@ func (c *WSClient) UnsubscribeFromWallet(ctx context.Context, address string) er
 		return fmt.Errorf("no subscription found for address: %s", address)
 	}
 
+	// Cancel the subscription context first
+	if sub.cancel != nil {
+		sub.cancel()
+	}
+
+	// Then unsubscribe from the websocket
 	sub.sub.Unsubscribe()
 
+	// Remove from subscriptions map
 	delete(c.subscriptions, address)
 	return nil
 }
