@@ -8,15 +8,12 @@ import (
 	"simo/internal/repository"
 	"simo/internal/service/parser"
 	"simo/internal/service/websocket"
-	"simo/pkg/discord"
 	"simo/pkg/solanatracker"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
-	"github.com/sourcegraph/conc"
 )
 
 type WalletTrackerService interface {
@@ -31,7 +28,7 @@ type WalletTrackerService interface {
 type WalletTracker struct {
 	db         *pgxpool.Pool
 	repo       repository.Repository
-	discords   map[string]discord.WebhookClient
+	notifier   NotificationService
 	wsClient   *websocket.WSClient
 	solTracker *solanatracker.Client
 	parser     *parser.TransactionParser
@@ -71,37 +68,15 @@ func NewWalletTracker(ctx context.Context, cfg Config, logger zerolog.Logger) (*
 		return nil, fmt.Errorf("failed to create SolanaTracker client: %w", err)
 	}
 
-	webhooks, err := repo.GetWebhooks(ctx)
+	notifier, err := NewDiscordNotifier(repo, logger)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get webhooks: %w", err)
-	}
-
-	discords := make(map[string]discord.WebhookClient)
-	for _, webhook := range webhooks {
-		webhookID, webhookToken, err := discord.ParseWebhookURL(webhook.WebhookURL)
-		if err != nil {
-			logger.Error().
-				Err(err).
-				Str("webhook_name", webhook.Name).
-				Msg("Failed to parse webhook URL")
-			continue
-		}
-
-		client, err := discord.NewWebhookClient(webhookID, webhookToken)
-		if err != nil {
-			logger.Error().
-				Err(err).
-				Str("webhook_name", webhook.Name).
-				Msg("Failed to create webhook client")
-			continue
-		}
-		discords[webhook.Name] = client
+		return nil, fmt.Errorf("failed to initialize discord notifier: %w", err)
 	}
 
 	tracker := &WalletTracker{
 		db:         dbPool,
 		repo:       repo,
-		discords:   discords,
+		notifier:   notifier,
 		wsClient:   wsClient,
 		solTracker: solTracker,
 		logger:     logger,
@@ -376,157 +351,11 @@ func (wt *WalletTracker) handleTransaction(ctx context.Context, walletAddress, s
 		}
 	}
 
-	message := constructDiscordMessage(wallet, swapDetails, tokenInInfo, tokenOutInfo, pnl)
-
-	if err := wt.sendMessageToAllWebhooks(msgCtx, message); err != nil {
+	if err := wt.notifier.SendSwapNotification(msgCtx, wallet, swapDetails, tokenInInfo, tokenOutInfo, pnl); err != nil {
 		txLogger.Error().Err(err).Msg("Failed to send Discord message")
 		return fmt.Errorf("message delivery error: %w", err)
 	}
 
 	txLogger.Info().Msg("Transaction handling completed successfully")
 	return nil
-}
-
-func (wt *WalletTracker) sendMessageToAllWebhooks(ctx context.Context, message string) error {
-	var wg conc.WaitGroup
-	defer wg.Wait()
-	var errs []error
-	var errMu sync.Mutex // Mutex to safely collect errors from goroutines
-
-	for name, client := range wt.discords {
-		name, client := name, client // Create new variables for goroutine
-		wg.Go(func() {
-			// Create a context with timeout for each webhook call
-			webhookCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-
-			// Send message with context
-			if err := client.SendMessage(webhookCtx, message); err != nil {
-				wt.logger.Error().
-					Err(err).
-					Str("webhook_name", name).
-					Msg("Failed to send message to webhook")
-
-				errMu.Lock()
-				errs = append(errs, fmt.Errorf("webhook %s: %w", name, err))
-				errMu.Unlock()
-			}
-		})
-	}
-
-	// Wait for all goroutines to complete
-	wg.Wait()
-
-	if len(errs) > 0 {
-		return fmt.Errorf("failed to send message to some webhooks: %v", errs)
-	}
-	return nil
-}
-
-// constructDiscordMessage creates a formatted Discord message for swap transactions.
-// It handles cases where token information might be missing and includes optional PNL data.
-func constructDiscordMessage(
-	wallet *repository.Wallet,
-	swap *parser.SwapDetails,
-	tokenInInfo *solanatracker.TokenInfo,
-	tokenOutInfo *solanatracker.TokenInfo,
-	pnl *solanatracker.ProfitLoss,
-) string {
-	// Helper function to format token details, providing consistent formatting
-	// even when token information is unavailable
-	formatTokenInfo := func(mint string, amount float64, info *solanatracker.TokenInfo) string {
-		if info == nil {
-			return fmt.Sprintf("> Unknown Token\n"+
-				"> **Amount**: `%.6f`\n"+
-				"> **Address**: `%s`", amount, mint)
-		}
-
-		return fmt.Sprintf("> %s (%s)\n"+
-			"> **Amount**: `%.6f %s`\n"+
-			"> **Address**: [%s](https://ape.pro/solana/%s)\n",
-			info.Token.Name,
-			info.Token.Symbol,
-			amount,
-			info.Token.Symbol,
-			mint, mint)
-	}
-
-	addMarketCapAndRisks := func(info *solanatracker.TokenInfo) string {
-		if info == nil {
-			return ""
-		}
-
-		if info.Token.Mint == "So11111111111111111111111111111111111111112" {
-			return ""
-		}
-
-		// check that there's a risk score
-		var risks string
-		if len(info.Risk.Risks) != 0 {
-			risks = "> **Risks**:\n"
-			for _, risk := range info.Risk.Risks {
-				risks += fmt.Sprintf("> %s: %s\n", risk.Name, risk.Description)
-			}
-		}
-
-		return fmt.Sprintf("> **Market Cap**: `%.6f usd`\n"+
-			"%s\n\n",
-			info.Pools[0].MarketCap.USD,
-			risks)
-	}
-
-	// Construct the message by building each section
-	// Start with the header containing links to blockchain explorers
-	header := fmt.Sprintf("# 💱 New Swap Alert\n"+
-		"### [View Wallet](https://solana.fm/address/%s) | [View Transaction](https://solscan.io/tx/%s)\n\n",
-		wallet.Address, swap.Signature)
-
-	// Add the token input section with detailed information about the source token
-	tokenInSection := fmt.Sprintf("**From Token**\n%s",
-		formatTokenInfo(
-			swap.TokenIn.Address.String(),
-			swap.AmountIn.Amount,
-			tokenInInfo,
-		))
-
-	tokenInSection += addMarketCapAndRisks(tokenInInfo)
-
-	// Add the token output section with information about the destination token
-	tokenOutSection := fmt.Sprintf("**To Token**\n%s",
-		formatTokenInfo(
-			swap.TokenOut.Address.String(),
-			swap.AmountOut.Amount,
-			tokenOutInfo,
-		))
-
-	tokenOutSection += addMarketCapAndRisks(tokenOutInfo)
-
-	// Add transaction details including DEX information and timing
-	detailsSection := fmt.Sprintf("**Details**\n"+
-		"> 🏦 **DEX**: `%s`\n"+
-		"> 👛 **Wallet**: `%s`\n"+
-		"> ⏰ **Time**: `%s`",
-		swap.Program,
-		wallet.Address,
-		swap.Timestamp.Format("2006-01-02 15:04:05 MST"))
-
-	// Add PNL information if available and if the input token isn't wrapped SOL
-	// We check both the PNL data and the token type to ensure relevant PNL reporting
-	if pnl != nil && tokenInInfo != nil &&
-		tokenInInfo.Token.Mint != "So11111111111111111111111111111111111111112" {
-		detailsSection += fmt.Sprintf("\n> 🤑 PNL Realized: `%.6f`\n"+
-			"> 💰 PNL Unrealized: `%.6f`",
-			pnl.Realized,
-			pnl.Unrealized)
-	}
-
-	// Combine all sections into the final message
-	message := strings.Join([]string{
-		header,
-		tokenInSection,
-		tokenOutSection,
-		detailsSection,
-	}, "")
-
-	return message
 }

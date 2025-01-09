@@ -38,6 +38,12 @@ func NewServer(cfg Config, h *handler.Handler, logger zerolog.Logger) *Server {
 		r.Post("/wallets", h.AddWallet)
 		r.Get("/wallets", h.ListWallets)
 		r.Delete("/wallets/{address}", h.RemoveWallet)
+
+		// Wallet alias routes
+		r.Post("/wallets/{address}/aliases", h.AddWalletAlias)
+		r.Get("/wallets/{address}/aliases", h.ListWalletAliases)
+		r.Delete("/wallets/{address}/aliases/{alias}", h.RemoveWalletAlias)
+		r.Get("/aliases/{alias}", h.GetWalletByAlias)
 	})
 
 	srv := &http.Server{
