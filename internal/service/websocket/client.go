@@ -342,16 +342,45 @@ func (c *WSClient) resubscribeAll() error {
 }
 
 func (c *WSClient) Close() error {
+	// Signal all goroutines to stop
 	close(c.done)
 
-	c.reconnectWG.Wait()
-	c.wg.Wait()
+	// Create a channel to signal completion of cleanup
+	done := make(chan struct{})
 
-	if c.client != nil {
-		c.setState(disconnected)
-		c.client.Close()
-		c.client = nil
+	go func() {
+		// Unsubscribe from all subscriptions first
+		c.subscriptionsMu.Lock()
+		for address, sub := range c.subscriptions {
+			if sub != nil && sub.sub != nil {
+				sub.sub.Unsubscribe()
+				c.logger.Info().
+					Str("wallet", address).
+					Msg("Unsubscribed wallet during shutdown")
+			}
+		}
+		// Clear the subscriptions map
+		c.subscriptions = make(map[string]*Subscription)
+		c.subscriptionsMu.Unlock()
+
+		// Wait for all goroutines to finish
+		c.reconnectWG.Wait()
+		c.wg.Wait()
+
+		if c.client != nil {
+			c.setState(disconnected)
+			c.client.Close()
+			c.client = nil
+		}
+
+		close(done)
+	}()
+
+	// Wait for cleanup with a timeout
+	select {
+	case <-done:
+		return nil
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("websocket client close timed out after 10 seconds")
 	}
-
-	return nil
 }

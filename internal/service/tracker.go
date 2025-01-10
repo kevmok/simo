@@ -105,31 +105,81 @@ func (wt *WalletTracker) Close() {
 
 	wt.logger.Info().Msg("starting graceful shutdown of wallet tracker")
 
-	// First unsubscribe all wallets
-	wallets, err := wt.GetWallets(ctx)
-	if err != nil {
-		wt.logger.Error().Err(err).Msg("failed to get wallets during shutdown")
-	} else {
-		for _, wallet := range wallets {
-			if err := wt.wsClient.UnsubscribeFromWallet(ctx, wallet.Address); err != nil {
-				wt.logger.Error().
-					Err(err).
-					Str("wallet", wallet.Address).
-					Msg("failed to unsubscribe wallet during shutdown")
+	// Create channels to track completion of each shutdown phase
+	wsClientDone := make(chan struct{})
+	dbDone := make(chan struct{})
+
+	// First unsubscribe all wallets and close websocket client
+	go func() {
+		defer close(wsClientDone)
+
+		// Get wallets with a shorter timeout
+		walletCtx, walletCancel := context.WithTimeout(ctx, 3*time.Second)
+		defer walletCancel()
+
+		wallets, err := wt.GetWallets(walletCtx)
+		if err != nil {
+			wt.logger.Error().Err(err).Msg("failed to get wallets during shutdown")
+		} else {
+			// Create a WaitGroup for parallel unsubscribe operations
+			var wg sync.WaitGroup
+			for _, wallet := range wallets {
+				wg.Add(1)
+				go func(address string) {
+					defer wg.Done()
+					if err := wt.wsClient.UnsubscribeFromWallet(ctx, address); err != nil {
+						wt.logger.Error().
+							Err(err).
+							Str("wallet", address).
+							Msg("failed to unsubscribe wallet during shutdown")
+					}
+				}(wallet.Address)
+			}
+
+			// Wait for all unsubscribe operations with timeout
+			unsubDone := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(unsubDone)
+			}()
+
+			select {
+			case <-unsubDone:
+				wt.logger.Info().Msg("all wallets unsubscribed")
+			case <-ctx.Done():
+				wt.logger.Warn().Msg("wallet unsubscribe timed out")
 			}
 		}
-	}
 
-	// Then close the websocket client
-	if wt.wsClient != nil {
-		if err := wt.wsClient.Close(); err != nil {
-			wt.logger.Error().Err(err).Msg("failed to close websocket client")
+		// Close websocket client
+		if wt.wsClient != nil {
+			if err := wt.wsClient.Close(); err != nil {
+				wt.logger.Error().Err(err).Msg("failed to close websocket client")
+			}
 		}
+	}()
+
+	// Close database connection in parallel
+	go func() {
+		defer close(dbDone)
+		if wt.db != nil {
+			wt.db.Close()
+		}
+	}()
+
+	// Wait for all components to shut down or timeout
+	select {
+	case <-wsClientDone:
+		wt.logger.Info().Msg("websocket client shutdown complete")
+	case <-ctx.Done():
+		wt.logger.Error().Msg("websocket client shutdown timed out")
 	}
 
-	// Finally close the database
-	if wt.db != nil {
-		wt.db.Close()
+	select {
+	case <-dbDone:
+		wt.logger.Info().Msg("database connection closed")
+	case <-ctx.Done():
+		wt.logger.Error().Msg("database shutdown timed out")
 	}
 
 	wt.logger.Info().Msg("wallet tracker shutdown complete")

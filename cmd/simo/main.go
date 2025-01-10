@@ -10,6 +10,7 @@ import (
 	"simo/internal/handler"
 	"simo/internal/server"
 	"simo/internal/service"
+	"sync"
 	"syscall"
 	"time"
 
@@ -161,13 +162,65 @@ func initializeComponents(ctx context.Context, config service.Config, logger *ze
 }
 
 func gracefulShutdown(ctx context.Context, components *Components, logger *zerolog.Logger) error {
-	// Stop accepting new connections first
-	if err := components.server.Shutdown(ctx); err != nil {
-		logger.Error().Err(err).Msg("Failed to shutdown server")
-	}
+	// Create a WaitGroup to track shutdown completion
+	var wg sync.WaitGroup
+	shutdownErrs := make(chan error, 2) // Buffer for server and tracker errors
+
+	// First stop accepting new HTTP connections
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		logger.Info().Msg("Shutting down HTTP server")
+		if err := components.server.Shutdown(ctx); err != nil {
+			logger.Error().Err(err).Msg("Failed to shutdown server")
+			shutdownErrs <- fmt.Errorf("server shutdown error: %w", err)
+		}
+	}()
 
 	// Then close the tracker (websocket connections)
-	components.tracker.Close()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		logger.Info().Msg("Shutting down wallet tracker")
 
-	return nil
+		// Create a separate context for tracker shutdown
+		trackerCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+
+		doneChan := make(chan struct{})
+		go func() {
+			components.tracker.Close()
+			close(doneChan)
+		}()
+
+		select {
+		case <-doneChan:
+			logger.Info().Msg("Wallet tracker shutdown completed")
+		case <-trackerCtx.Done():
+			shutdownErrs <- fmt.Errorf("wallet tracker shutdown timed out")
+			logger.Error().Msg("Wallet tracker shutdown timed out")
+		}
+	}()
+
+	// Wait for all components to finish shutting down
+	wgDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(wgDone)
+	}()
+
+	select {
+	case <-wgDone:
+		logger.Info().Msg("All components shut down successfully")
+	case <-ctx.Done():
+		return fmt.Errorf("shutdown timed out")
+	}
+
+	// Check if there were any shutdown errors
+	select {
+	case err := <-shutdownErrs:
+		return err
+	default:
+		return nil
+	}
 }
