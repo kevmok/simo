@@ -199,12 +199,6 @@ func (c *WSClient) SubscribeToWallet(ctx context.Context, address string, callba
 }
 
 func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
-	defer func() {
-		c.subscriptionsMu.Lock()
-		delete(c.subscriptions, address)
-		c.subscriptionsMu.Unlock()
-	}()
-
 	for {
 		select {
 		case <-c.done:
@@ -216,6 +210,19 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 					Err(err).
 					Str("wallet", address).
 					Msg("Error receiving log notification")
+
+				// Check if subscription still exists before attempting reconnect
+				c.subscriptionsMu.RLock()
+				_, exists := c.subscriptions[address]
+				c.subscriptionsMu.RUnlock()
+
+				if !exists {
+					// Subscription was intentionally removed, exit gracefully
+					c.logger.Info().
+						Str("wallet", address).
+						Msg("Subscription removed, stopping handler")
+					return
+				}
 
 				if err := c.attemptReconnect(); err != nil {
 					c.logger.Error().
@@ -250,16 +257,21 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 
 func (c *WSClient) UnsubscribeFromWallet(ctx context.Context, address string) error {
 	c.subscriptionsMu.Lock()
-	defer c.subscriptionsMu.Unlock()
-
 	sub, exists := c.subscriptions[address]
 	if !exists {
+		c.subscriptionsMu.Unlock()
 		return fmt.Errorf("no subscription found for address: %s", address)
 	}
 
-	sub.sub.Unsubscribe()
-
+	// Mark subscription for deletion before unlocking
 	delete(c.subscriptions, address)
+	c.subscriptionsMu.Unlock()
+
+	// Unsubscribe after removing from map to prevent reconnection attempts
+	if sub != nil && sub.sub != nil {
+		sub.sub.Unsubscribe()
+	}
+
 	return nil
 }
 
