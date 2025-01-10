@@ -197,6 +197,13 @@ func (r *PostgresRepository) RemoveWallet(ctx context.Context, address string) e
 		return err
 	}
 
+	// Delete aliases
+	deleteAliasesQuery := `DELETE FROM wallet_aliases WHERE wallet_id = $1`
+	_, err = tx.Exec(ctx, deleteAliasesQuery, walletID)
+	if err != nil {
+		return err
+	}
+
 	// Finally, delete the wallet
 	deleteWalletQuery := `DELETE FROM wallets WHERE id = $1`
 	result, err := tx.Exec(ctx, deleteWalletQuery, walletID)
