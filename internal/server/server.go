@@ -35,6 +35,11 @@ func NewServer(cfg Config, h *handler.Handler, logger zerolog.Logger) *Server {
 
 	// Routes
 	r.Route("/api/v1", func(r chi.Router) {
+		// Status endpoints
+		r.Get("/status", h.GetStatus)
+		r.Get("/wallets/{address}/status", h.GetWalletStatus)
+
+		// Wallet management
 		r.Post("/wallets", h.AddWallet)
 		r.Get("/wallets", h.ListWallets)
 		r.Delete("/wallets/{address}", h.RemoveWallet)

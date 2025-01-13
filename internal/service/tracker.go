@@ -21,6 +21,9 @@ type WalletTrackerService interface {
 	AddWallet(ctx context.Context, address string) error
 	RemoveWallet(ctx context.Context, address string) error
 	GetWallets(ctx context.Context) ([]repository.Wallet, error)
+	GetConnectionStatus() websocket.ConnectionStatus
+	GetSubscriptionStatus(address string) (*websocket.SubscriptionStatus, error)
+	GetAllSubscriptionStatuses() map[string]*websocket.SubscriptionStatus
 
 	handleTransaction(ctx context.Context, walletAddress, signature string) error
 }
@@ -225,6 +228,18 @@ func (wt *WalletTracker) GetWalletPositions(ctx context.Context, address string)
 		return nil, err
 	}
 	return wt.repo.GetTokenPositions(ctx, wallet.ID)
+}
+
+func (wt *WalletTracker) GetConnectionStatus() websocket.ConnectionStatus {
+	return wt.wsClient.GetConnectionStatus()
+}
+
+func (wt *WalletTracker) GetSubscriptionStatus(address string) (*websocket.SubscriptionStatus, error) {
+	return wt.wsClient.GetSubscriptionStatus(address)
+}
+
+func (wt *WalletTracker) GetAllSubscriptionStatuses() map[string]*websocket.SubscriptionStatus {
+	return wt.wsClient.GetAllSubscriptionStatuses()
 }
 
 func (wt *WalletTracker) initializeWalletTracking(ctx context.Context) error {
