@@ -29,6 +29,23 @@ const (
 	connected
 )
 
+// SubscriptionStatus represents the current status of a subscription
+type SubscriptionStatus struct {
+	IsActive       bool      `json:"is_active"`
+	LastActivity   time.Time `json:"last_activity"`
+	ErrorCount     int       `json:"error_count"`
+	IsReconnecting bool      `json:"is_reconnecting"`
+}
+
+// ConnectionStatus represents the current status of the WebSocket connection
+type ConnectionStatus struct {
+	State               string    `json:"state"`
+	LastConnected       time.Time `json:"last_connected"`
+	ReconnectCount      int       `json:"reconnect_count"`
+	CircuitBreaker      string    `json:"circuit_breaker"`
+	ActiveSubscriptions int       `json:"active_subscriptions"`
+}
+
 type WSClient struct {
 	config Config
 	logger zerolog.Logger
@@ -44,8 +61,14 @@ type WSClient struct {
 	wg conc.WaitGroup
 
 	// Connection state management
-	state   connectionState
-	stateMu sync.RWMutex
+	state          connectionState
+	stateMu        sync.RWMutex
+	lastConnected  time.Time
+	reconnectCount int
+
+	// Subscription monitoring
+	subscriptionStatus map[string]*SubscriptionStatus
+	statusMu           sync.RWMutex
 }
 
 // TransactionInfo contains relevant information about a transaction
@@ -109,11 +132,12 @@ func NewClient(config Config, logger zerolog.Logger) (*WSClient, error) {
 	}
 
 	return &WSClient{
-		config:         config,
-		logger:         logger,
-		subscriptions:  make(map[string]*Subscription),
-		done:           make(chan struct{}),
-		circuitBreaker: gobreaker.NewCircuitBreaker(config.CircuitBreakerSettings),
+		config:             config,
+		logger:             logger,
+		subscriptions:      make(map[string]*Subscription),
+		subscriptionStatus: make(map[string]*SubscriptionStatus),
+		done:               make(chan struct{}),
+		circuitBreaker:     gobreaker.NewCircuitBreaker(config.CircuitBreakerSettings),
 	}, nil
 }
 
@@ -126,7 +150,85 @@ func (c *WSClient) getState() connectionState {
 func (c *WSClient) setState(state connectionState) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
+	if state == connected && c.state != connected {
+		c.lastConnected = time.Now()
+	}
 	c.state = state
+}
+
+// GetConnectionStatus returns the current status of the WebSocket connection
+func (c *WSClient) GetConnectionStatus() ConnectionStatus {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+
+	c.subscriptionsMu.RLock()
+	activeCount := len(c.subscriptions)
+	c.subscriptionsMu.RUnlock()
+
+	var stateStr string
+	switch c.state {
+	case connected:
+		stateStr = "connected"
+	case connecting:
+		stateStr = "connecting"
+	case disconnected:
+		stateStr = "disconnected"
+	}
+
+	return ConnectionStatus{
+		State:               stateStr,
+		LastConnected:       c.lastConnected,
+		ReconnectCount:      c.reconnectCount,
+		CircuitBreaker:      c.circuitBreaker.State().String(),
+		ActiveSubscriptions: activeCount,
+	}
+}
+
+// GetSubscriptionStatus returns the status of a specific subscription
+func (c *WSClient) GetSubscriptionStatus(address string) (*SubscriptionStatus, error) {
+	c.statusMu.RLock()
+	status, exists := c.subscriptionStatus[address]
+	c.statusMu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("no subscription found for address: %s", address)
+	}
+
+	return status, nil
+}
+
+// GetAllSubscriptionStatuses returns the status of all active subscriptions
+func (c *WSClient) GetAllSubscriptionStatuses() map[string]*SubscriptionStatus {
+	c.statusMu.RLock()
+	defer c.statusMu.RUnlock()
+
+	// Create a copy of the status map to avoid concurrent access issues
+	statuses := make(map[string]*SubscriptionStatus)
+	for addr, status := range c.subscriptionStatus {
+		statusCopy := *status // Create a copy of the status
+		statuses[addr] = &statusCopy
+	}
+
+	return statuses
+}
+
+// updateSubscriptionStatus updates the status of a subscription
+func (c *WSClient) updateSubscriptionStatus(address string, update func(*SubscriptionStatus)) {
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+
+	status, exists := c.subscriptionStatus[address]
+	if !exists {
+		status = &SubscriptionStatus{
+			IsActive:       true,
+			LastActivity:   time.Now(),
+			ErrorCount:     0,
+			IsReconnecting: false,
+		}
+		c.subscriptionStatus[address] = status
+	}
+
+	update(status)
 }
 
 func (c *WSClient) Connect(ctx context.Context) error {
@@ -151,7 +253,6 @@ func (c *WSClient) Connect(ctx context.Context) error {
 	c.setState(connected)
 
 	c.logger.Info().
-		Str("url", c.config.WSURL).
 		Msg("Successfully connected to WebSocket")
 
 	return nil
@@ -199,6 +300,18 @@ func (c *WSClient) SubscribeToWallet(ctx context.Context, address string, callba
 }
 
 func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
+	// Initialize subscription status
+	c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
+		status.IsActive = true
+		status.LastActivity = time.Now()
+		status.ErrorCount = 0
+		status.IsReconnecting = false
+	})
+
+	defer c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
+		status.IsActive = false
+	})
+
 	for {
 		select {
 		case <-c.done:
@@ -210,6 +323,11 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 					Err(err).
 					Str("wallet", address).
 					Msg("Error receiving log notification")
+
+				// Update status with error
+				c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
+					status.ErrorCount++
+				})
 
 				// Check if subscription still exists before attempting reconnect
 				c.subscriptionsMu.RLock()
@@ -224,6 +342,11 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 					return
 				}
 
+				// Update status for reconnection attempt
+				c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
+					status.IsReconnecting = true
+				})
+
 				if err := c.attemptReconnect(); err != nil {
 					c.logger.Error().
 						Err(err).
@@ -232,6 +355,12 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 				}
 				return
 			}
+
+			// Update status for successful activity
+			c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
+				status.LastActivity = time.Now()
+				status.IsReconnecting = false
+			})
 
 			c.subscriptionsMu.RLock()
 			subscription, exists := c.subscriptions[address]
