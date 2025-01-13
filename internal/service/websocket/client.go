@@ -323,19 +323,17 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 		case <-c.done:
 			return
 		default:
-			// Create a context with timeout for each receive operation
-			recvCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			notification, err := sub.Recv(recvCtx)
-			cancel()
+			// Use a background context for normal operations
+			notification, err := sub.Recv(context.Background())
 
 			if err != nil {
-				// Check for context cancellation first
-				if recvCtx.Err() != nil {
-					c.logger.Warn().
-						Err(recvCtx.Err()).
-						Str("wallet", address).
-						Msg("Receive operation timed out")
-					continue
+				// Check if we're shutting down
+				if c.done != nil {
+					select {
+					case <-c.done:
+						return
+					default:
+					}
 				}
 
 				c.logger.Error().
