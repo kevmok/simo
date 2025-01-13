@@ -65,6 +65,7 @@ type WSClient struct {
 	stateMu        sync.RWMutex
 	lastConnected  time.Time
 	reconnectCount int
+	reconnectMu    sync.Mutex // Mutex to prevent multiple simultaneous reconnection attempts
 
 	// Subscription monitoring
 	subscriptionStatus map[string]*SubscriptionStatus
@@ -310,18 +311,37 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 
 	defer c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
 		status.IsActive = false
+		status.IsReconnecting = false
 	})
+
+	consecutiveErrors := 0
+	const maxConsecutiveErrors = 3
+	errorBackoff := c.config.ReconnectInterval
 
 	for {
 		select {
 		case <-c.done:
 			return
 		default:
-			notification, err := sub.Recv(context.Background())
+			// Create a context with timeout for each receive operation
+			recvCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			notification, err := sub.Recv(recvCtx)
+			cancel()
+
 			if err != nil {
+				// Check for context cancellation first
+				if recvCtx.Err() != nil {
+					c.logger.Warn().
+						Err(recvCtx.Err()).
+						Str("wallet", address).
+						Msg("Receive operation timed out")
+					continue
+				}
+
 				c.logger.Error().
 					Err(err).
 					Str("wallet", address).
+					Int("consecutive_errors", consecutiveErrors+1).
 					Msg("Error receiving log notification")
 
 				// Update status with error
@@ -329,32 +349,58 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 					status.ErrorCount++
 				})
 
-				// Check if subscription still exists before attempting reconnect
+				// Check if subscription still exists
 				c.subscriptionsMu.RLock()
 				_, exists := c.subscriptions[address]
 				c.subscriptionsMu.RUnlock()
 
 				if !exists {
-					// Subscription was intentionally removed, exit gracefully
 					c.logger.Info().
 						Str("wallet", address).
 						Msg("Subscription removed, stopping handler")
 					return
 				}
 
-				// Update status for reconnection attempt
-				c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
-					status.IsReconnecting = true
-				})
+				consecutiveErrors++
 
-				if err := c.attemptReconnect(); err != nil {
-					c.logger.Error().
-						Err(err).
-						Msg("Failed to reconnect")
+				// Only attempt reconnect after multiple consecutive errors
+				if consecutiveErrors >= maxConsecutiveErrors {
+					c.logger.Warn().
+						Str("wallet", address).
+						Int("consecutive_errors", consecutiveErrors).
+						Msg("Too many consecutive errors, attempting reconnect")
+
+					// Update status for reconnection attempt
+					c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
+						status.IsReconnecting = true
+					})
+
+					if err := c.attemptReconnect(); err != nil {
+						if err.Error() == "reconnection already in progress" {
+							// Another goroutine is handling reconnection, wait and continue
+							time.Sleep(errorBackoff)
+							continue
+						}
+						c.logger.Error().
+							Err(err).
+							Msg("Failed to reconnect")
+						return
+					}
 					return
 				}
-				return
+
+				// Exponential backoff for errors
+				time.Sleep(errorBackoff)
+				errorBackoff = time.Duration(float64(errorBackoff) * 1.5)
+				if errorBackoff > 30*time.Second {
+					errorBackoff = 30 * time.Second
+				}
+				continue
 			}
+
+			// Reset error counters on successful receive
+			consecutiveErrors = 0
+			errorBackoff = c.config.ReconnectInterval
 
 			// Update status for successful activity
 			c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
@@ -405,55 +451,101 @@ func (c *WSClient) UnsubscribeFromWallet(ctx context.Context, address string) er
 }
 
 func (c *WSClient) attemptReconnect() error {
+	// Use reconnectMu to prevent multiple simultaneous reconnection attempts
+	if !c.reconnectMu.TryLock() {
+		return fmt.Errorf("reconnection already in progress")
+	}
+	defer c.reconnectMu.Unlock()
+
 	c.reconnectWG.Add(1)
 	defer c.reconnectWG.Done()
 
-	// Reset state and client
-	c.setState(disconnected)
+	// Create a context with timeout for the entire reconnection process
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.config.MaxReconnectAttempts)*c.config.ReconnectInterval*2)
+	defer cancel()
+
+	// Reset state and client under state mutex
+	c.stateMu.Lock()
+	c.state = disconnected
 	if c.client != nil {
 		c.client.Close()
 		c.client = nil
 	}
+	c.stateMu.Unlock()
 
 	attempts := 0
+	backoff := c.config.ReconnectInterval
+
 	for attempts < c.config.MaxReconnectAttempts {
+		// Check if we should stop reconnecting
+		select {
+		case <-c.done:
+			return fmt.Errorf("client is shutting down")
+		case <-ctx.Done():
+			return fmt.Errorf("reconnection timeout: %w", ctx.Err())
+		default:
+		}
+
 		c.logger.Info().
 			Int("attempt", attempts+1).
 			Int("maxAttempts", c.config.MaxReconnectAttempts).
+			Dur("backoff", backoff).
 			Msg("Attempting to reconnect")
 
-		if err := c.Connect(context.Background()); err != nil {
+		// Try to connect with a timeout
+		connectCtx, connectCancel := context.WithTimeout(ctx, 30*time.Second)
+		err := c.Connect(connectCtx)
+		connectCancel()
+
+		if err != nil {
+			if err.Error() == "connection already in progress" {
+				// Another goroutine is handling the connection
+				return err
+			}
 			c.logger.Error().Err(err).Msg("Reconnection attempt failed")
 			attempts++
-			time.Sleep(c.config.ReconnectInterval)
+			// Exponential backoff with a cap
+			backoff = time.Duration(float64(backoff) * 1.5)
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+			time.Sleep(backoff)
 			continue
 		}
 
-		if err := c.resubscribeAll(); err != nil {
+		// Try to resubscribe with a timeout
+		resubCtx, resubCancel := context.WithTimeout(ctx, 30*time.Second)
+		err = c.resubscribeAll(resubCtx)
+		resubCancel()
+
+		if err != nil {
 			c.logger.Error().
 				Err(err).
 				Msg("Failed to resubscribe wallets")
 
-			// Close the connection and try again
+			c.stateMu.Lock()
 			if c.client != nil {
 				c.client.Close()
 				c.client = nil
 			}
-			c.setState(disconnected)
+			c.state = disconnected
+			c.stateMu.Unlock()
 
 			attempts++
-			time.Sleep(c.config.ReconnectInterval)
+			time.Sleep(backoff)
 			continue
 		}
 
-		c.logger.Info().Msg("Successfully reconnected and resubscribed")
+		c.logger.Info().
+			Int("attempts", attempts+1).
+			Msg("Successfully reconnected and resubscribed")
 		return nil
 	}
 
-	return fmt.Errorf("max reconnection attempts reached")
+	return fmt.Errorf("max reconnection attempts reached after %d tries", attempts)
 }
 
-func (c *WSClient) resubscribeAll() error {
+func (c *WSClient) resubscribeAll(ctx context.Context) error {
 	c.subscriptionsMu.RLock()
 	subscriptions := make(map[string]func(TransactionInfo))
 	for address, sub := range c.subscriptions {
@@ -462,8 +554,13 @@ func (c *WSClient) resubscribeAll() error {
 	c.subscriptionsMu.RUnlock()
 
 	for address, callback := range subscriptions {
-		if err := c.SubscribeToWallet(context.Background(), address, callback); err != nil {
-			return fmt.Errorf("failed to resubscribe wallet %s: %w", address, err)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("resubscribe operation cancelled: %w", ctx.Err())
+		default:
+			if err := c.SubscribeToWallet(ctx, address, callback); err != nil {
+				return fmt.Errorf("failed to resubscribe wallet %s: %w", address, err)
+			}
 		}
 	}
 
