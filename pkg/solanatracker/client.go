@@ -4,17 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/exp/rand"
 )
 
 const (
-	baseURL           = "https://data.solanatracker.io"
-	defaultTimeout    = 30 * time.Second
-	maxRetries        = 3
-	defaultRetryDelay = 3 * time.Second
+	baseURL             = "https://data.solanatracker.io"
+	defaultTimeout      = 30 * time.Second
+	maxRetries          = 3
+	maxRateLimitRetries = 5 // Separate counter for rate limits
+	baseRetryDelay      = 2 * time.Second
 )
 
 type Client struct {
@@ -174,77 +178,78 @@ func (c *Client) GetProfitLoss(ctx context.Context, walletAddress, tokenAddress 
 	return &pnl, nil
 }
 
+// Updated doRequestWithRetry implementation
 func (c *Client) doRequestWithRetry(req *http.Request) (*http.Response, error) {
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			// Exponential backoff: 1s, 2s, 4s
-			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
-			time.Sleep(backoff)
-		}
+	var (
+		rateLimitRetries int
+		lastErr          error
+	)
 
-		resp, err := c.httpClient.Do(req)
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		resp, err := c.executeRequest(req)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 
-		// Handle different status codes
-		switch resp.StatusCode {
-		case http.StatusOK:
+		switch {
+		case resp.StatusCode == http.StatusTooManyRequests:
+			return c.handleRateLimit(req, resp, &rateLimitRetries)
+		case resp.StatusCode >= 500:
+			return c.handleServerError(resp)
+		case resp.StatusCode == http.StatusOK:
 			return resp, nil
-		case http.StatusTooManyRequests:
-			// Get retry delay from response headers
-			delay := getRetryDelay(resp)
-			resp.Body.Close()
-
-			// Check if we have retries left
-			if attempt == maxRetries {
-				return nil, fmt.Errorf("rate limit exceeded and out of retries")
-			}
-
-			// Log rate limit hit (you can modify this based on your logging setup)
-			fmt.Printf("Rate limit hit, waiting %v before retry\n", delay)
-
-			// Wait for the specified delay
-			select {
-			case <-req.Context().Done():
-				return nil, req.Context().Err()
-			case <-time.After(delay):
-				continue
-			}
-
-		case http.StatusUnauthorized,
-			http.StatusForbidden,
-			http.StatusNotFound:
-			// Don't retry on these status codes
-			return resp, nil
-
 		default:
-			resp.Body.Close()
-			lastErr = fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-			continue
+			return c.handleNonRetryableError(resp)
 		}
 	}
 
-	return nil, fmt.Errorf("all retry attempts failed: %w", lastErr)
+	return nil, fmt.Errorf("max retries exceeded: %w", lastErr)
 }
 
+// New helper methods
+func (c *Client) handleRateLimit(req *http.Request, resp *http.Response, retryCount *int) (*http.Response, error) {
+	defer resp.Body.Close()
+
+	if *retryCount >= maxRateLimitRetries {
+		return nil, fmt.Errorf("max rate limit retries (%d) exceeded", maxRateLimitRetries)
+	}
+
+	delay := getRetryDelay(resp)
+	log.Printf("Rate limited - retry %d/%d in %v",
+		*retryCount+1, maxRateLimitRetries, delay)
+
+	select {
+	case <-time.After(delay):
+		*retryCount++
+		return c.doRequestWithRetry(req)
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	}
+}
+
+func (c *Client) executeRequest(req *http.Request) (*http.Response, error) {
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (c *Client) handleServerError(resp *http.Response) (*http.Response, error) {
+	defer resp.Body.Close()
+	return nil, fmt.Errorf("server error: %d", resp.StatusCode)
+}
+
+func (c *Client) handleNonRetryableError(resp *http.Response) (*http.Response, error) {
+	defer resp.Body.Close()
+	return nil, fmt.Errorf("non-retryable error: %d", resp.StatusCode)
+}
+
+// Updated getRetryDelay with jitter
 func getRetryDelay(resp *http.Response) time.Duration {
-	retryAfter := resp.Header.Get("Retry-After")
-	if retryAfter == "" {
-		return defaultRetryDelay
+	if delay, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil {
+		return time.Duration(delay)*time.Second + time.Duration(rand.Int63n(1000))*time.Millisecond
 	}
-
-	// Try to parse as seconds
-	if seconds, err := strconv.Atoi(retryAfter); err == nil {
-		return time.Duration(seconds) * time.Second
-	}
-
-	// Try to parse as HTTP date
-	if date, err := time.Parse(time.RFC1123, retryAfter); err == nil {
-		return time.Until(date)
-	}
-
-	return defaultRetryDelay
+	return baseRetryDelay + time.Duration(rand.Int63n(2000))*time.Millisecond
 }
