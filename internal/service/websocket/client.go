@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/sony/gobreaker"
 	"github.com/sourcegraph/conc"
+	"golang.org/x/exp/rand"
 )
 
 type Config struct {
@@ -121,6 +122,14 @@ func NewClient(config Config, logger zerolog.Logger) (*WSClient, error) {
 
 	// Check if CircuitBreakerSettings needs defaults
 	defaultSettings := DefaultConfig().CircuitBreakerSettings
+
+	config.CircuitBreakerSettings.OnStateChange = func(name string, from, to gobreaker.State) {
+		logger.Info().
+			Str("from", from.String()).
+			Str("to", to.String()).
+			Msg("Circuit breaker state changed")
+	}
+
 	if config.CircuitBreakerSettings.Name == "" &&
 		config.CircuitBreakerSettings.MaxRequests == 0 &&
 		config.CircuitBreakerSettings.Interval == 0 &&
@@ -291,6 +300,14 @@ func (c *WSClient) SubscribeToWallet(ctx context.Context, address string, callba
 
 		// Start subscription handler
 		c.wg.Go(func() {
+			defer func() {
+				if r := recover(); r != nil {
+					c.logger.Error().
+						Str("address", address).
+						Interface("panic", r).
+						Msg("Recovered from panic in subscription handler")
+				}
+			}()
 			c.handleSubscription(address, sub)
 		})
 
@@ -309,122 +326,170 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 		status.IsReconnecting = false
 	})
 
-	defer c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
-		status.IsActive = false
-		status.IsReconnecting = false
-	})
+	defer func() {
+		// Clean up subscription status
+		c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
+			status.IsActive = false
+			status.IsReconnecting = false
+		})
+
+		// Remove subscription from map
+		c.subscriptionsMu.Lock()
+		delete(c.subscriptions, address)
+		c.subscriptionsMu.Unlock()
+
+		// Recover from any panics
+		if r := recover(); r != nil {
+			c.logger.Error().
+				Str("address", address).
+				Interface("panic", r).
+				Msg("Recovered from panic in subscription handler")
+		}
+	}()
 
 	consecutiveErrors := 0
-	const maxConsecutiveErrors = 3
 	errorBackoff := c.config.ReconnectInterval
 
 	for {
 		select {
 		case <-c.done:
+			c.logger.Debug().
+				Str("address", address).
+				Msg("Subscription handler exiting due to shutdown")
 			return
 		default:
-			// Use a background context for normal operations
-			notification, err := sub.Recv(context.Background())
+			// Create a channel to receive the result of Recv()
+			recvResult := make(chan struct {
+				notification *ws.LogResult
+				err          error
+			}, 1)
 
-			if err != nil {
-				// Check if we're shutting down
-				if c.done != nil {
-					select {
-					case <-c.done:
-						return
-					default:
-					}
+			// Run Recv() in a goroutine to prevent blocking
+			go func() {
+				notif, err := sub.Recv(context.Background())
+				recvResult <- struct {
+					notification *ws.LogResult
+					err          error
+				}{notif, err}
+			}()
+
+			// Wait for either shutdown signal or receive result
+			select {
+			case <-c.done:
+				c.logger.Debug().
+					Str("address", address).
+					Msg("Subscription handler exiting due to shutdown")
+				return
+			case result := <-recvResult:
+				if result.err != nil {
+					// Handle error case
+					c.handleSubscriptionError(address, result.err, &consecutiveErrors, &errorBackoff)
+					continue
 				}
 
-				c.logger.Error().
-					Err(err).
-					Str("wallet", address).
-					Int("consecutive_errors", consecutiveErrors+1).
-					Msg("Error receiving log notification")
+				// Reset error counters on successful receive
+				consecutiveErrors = 0
+				errorBackoff = c.config.ReconnectInterval
 
-				// Update status with error
-				c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
-					status.ErrorCount++
-				})
-
-				// Check if subscription still exists
-				c.subscriptionsMu.RLock()
-				_, exists := c.subscriptions[address]
-				c.subscriptionsMu.RUnlock()
-
-				if !exists {
-					c.logger.Info().
-						Str("wallet", address).
-						Msg("Subscription removed, stopping handler")
-					return
-				}
-
-				consecutiveErrors++
-
-				// Only attempt reconnect after multiple consecutive errors
-				if consecutiveErrors >= maxConsecutiveErrors {
-					c.logger.Warn().
-						Str("wallet", address).
-						Int("consecutive_errors", consecutiveErrors).
-						Msg("Too many consecutive errors, attempting reconnect")
-
-					// Update status for reconnection attempt
-					c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
-						status.IsReconnecting = true
-					})
-
-					if err := c.attemptReconnect(); err != nil {
-						if err.Error() == "reconnection already in progress" {
-							// Another goroutine is handling reconnection, wait and continue
-							time.Sleep(errorBackoff)
-							continue
-						}
-						c.logger.Error().
-							Err(err).
-							Msg("Failed to reconnect")
-						return
-					}
-					return
-				}
-
-				// Exponential backoff for errors
-				time.Sleep(errorBackoff)
-				errorBackoff = time.Duration(float64(errorBackoff) * 1.5)
-				if errorBackoff > 30*time.Second {
-					errorBackoff = 30 * time.Second
-				}
-				continue
+				// Process successful notification
+				c.processNotification(address, result.notification)
 			}
-
-			// Reset error counters on successful receive
-			consecutiveErrors = 0
-			errorBackoff = c.config.ReconnectInterval
-
-			// Update status for successful activity
-			c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
-				status.LastActivity = time.Now()
-				status.IsReconnecting = false
-			})
-
-			c.subscriptionsMu.RLock()
-			subscription, exists := c.subscriptions[address]
-			if exists && subscription.callback != nil {
-				var txError error
-				if notification.Value.Err != nil {
-					txError = fmt.Errorf("%v", notification.Value.Err)
-				}
-
-				txInfo := TransactionInfo{
-					Signature: notification.Value.Signature.String(),
-					Slot:      notification.Context.Slot,
-					Logs:      notification.Value.Logs,
-					Error:     txError,
-					Timestamp: time.Now(),
-				}
-				subscription.callback(txInfo)
-			}
-			c.subscriptionsMu.RUnlock()
 		}
+	}
+}
+
+func (c *WSClient) handleSubscriptionError(address string, err error, consecutiveErrors *int, errorBackoff *time.Duration) {
+	c.logger.Error().
+		Err(err).
+		Str("wallet", address).
+		Int("consecutive_errors", *consecutiveErrors+1).
+		Msg("Error receiving log notification")
+
+	// Update status with error
+	c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
+		status.ErrorCount++
+	})
+
+	// Check if subscription still exists
+	c.subscriptionsMu.RLock()
+	_, exists := c.subscriptions[address]
+	c.subscriptionsMu.RUnlock()
+
+	if !exists {
+		c.logger.Info().
+			Str("wallet", address).
+			Msg("Subscription removed, stopping handler")
+		return
+	}
+
+	*consecutiveErrors++
+	const maxConsecutiveErrors = 3
+
+	// Handle reconnection after max errors
+	if *consecutiveErrors >= maxConsecutiveErrors {
+		c.logger.Warn().
+			Str("wallet", address).
+			Int("consecutive_errors", *consecutiveErrors).
+			Msg("Too many consecutive errors, attempting reconnect")
+
+		c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
+			status.IsReconnecting = true
+		})
+
+		if err := c.attemptReconnect(); err != nil {
+			c.logger.Error().
+				Err(err).
+				Msg("Failed to reconnect")
+			return
+		}
+		return
+	}
+
+	// Exponential backoff with jitter
+	sleepDuration := *errorBackoff + time.Duration(rand.Int63n(int64(*errorBackoff/2)))
+	time.Sleep(sleepDuration)
+	*errorBackoff = time.Duration(float64(*errorBackoff) * 1.5)
+	if *errorBackoff > 30*time.Second {
+		*errorBackoff = 30 * time.Second
+	}
+}
+
+func (c *WSClient) processNotification(address string, notification *ws.LogResult) {
+	c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
+		status.LastActivity = time.Now()
+		status.IsReconnecting = false
+	})
+
+	c.subscriptionsMu.RLock()
+	subscription, exists := c.subscriptions[address]
+	c.subscriptionsMu.RUnlock()
+
+	if exists && subscription.callback != nil {
+		var txError error
+		if notification.Value.Err != nil {
+			txError = fmt.Errorf("%v", notification.Value.Err)
+		}
+
+		txInfo := TransactionInfo{
+			Signature: notification.Value.Signature.String(),
+			Slot:      notification.Context.Slot,
+			Logs:      notification.Value.Logs,
+			Error:     txError,
+			Timestamp: time.Now(),
+		}
+
+		// Execute callback with panic protection
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					c.logger.Error().
+						Str("address", address).
+						Interface("panic", r).
+						Msg("Recovered from panic in callback")
+				}
+			}()
+			subscription.callback(txInfo)
+		}()
 	}
 }
 
@@ -475,6 +540,9 @@ func (c *WSClient) attemptReconnect() error {
 	backoff := c.config.ReconnectInterval
 
 	for attempts < c.config.MaxReconnectAttempts {
+		c.logger.Debug().
+			Int("attempt", attempts+1).
+			Msg("Performing reconnection attempt")
 		// Check if we should stop reconnecting
 		select {
 		case <-c.done:
