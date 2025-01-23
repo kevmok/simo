@@ -544,24 +544,35 @@ func (c *WSClient) attemptReconnect() error {
 }
 
 func (c *WSClient) resubscribeAll(ctx context.Context) error {
-	c.subscriptionsMu.RLock()
-	subscriptions := make(map[string]func(TransactionInfo))
-	for address, sub := range c.subscriptions {
-		subscriptions[address] = sub.callback
-	}
-	c.subscriptionsMu.RUnlock()
+	c.subscriptionsMu.Lock()
+	defer c.subscriptionsMu.Unlock()
 
-	for address, callback := range subscriptions {
+	// Create copy of existing subscriptions
+	subsToResubscribe := make(map[string]func(TransactionInfo), len(c.subscriptions))
+	for address, sub := range c.subscriptions {
+		// Unsubscribe existing subscription
+		if sub.sub != nil {
+			sub.sub.Unsubscribe()
+		}
+		subsToResubscribe[address] = sub.callback
+	}
+
+	// Clear current subscriptions before resubscribing
+	c.subscriptions = make(map[string]*Subscription)
+
+	// Resubscribe using the public method
+	for address, callback := range subsToResubscribe {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("resubscribe operation cancelled: %w", ctx.Err())
+			return ctx.Err()
 		default:
-			if err := c.SubscribeToWallet(ctx, address, callback); err != nil {
-				return fmt.Errorf("failed to resubscribe wallet %s: %w", address, err)
+			// Use the public SubscribeToWallet method which includes circuit breaker logic
+			err := c.SubscribeToWallet(ctx, address, callback)
+			if err != nil {
+				return fmt.Errorf("failed to resubscribe to %s: %w", address, err)
 			}
 		}
 	}
-
 	return nil
 }
 
