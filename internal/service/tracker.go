@@ -102,31 +102,90 @@ func (wt *WalletTracker) Close() {
 	wt.closed = true
 	wt.mu.Unlock()
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Create a context with timeout for graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	wt.logger.Info().Msg("Starting graceful shutdown")
+	wt.logger.Info().Msg("starting graceful shutdown of wallet tracker")
 
-	// First close websocket client (will handle its own cleanup)
-	if wt.wsClient != nil {
-		if err := wt.wsClient.Close(); err != nil {
-			wt.logger.Error().Err(err).Msg("WebSocket client shutdown error")
+	// Create channels to track completion of each shutdown phase
+	wsClientDone := make(chan struct{})
+	dbDone := make(chan struct{})
+
+	// First unsubscribe all wallets and close websocket client
+	go func() {
+		defer close(wsClientDone)
+
+		// Get wallets with a shorter timeout
+		walletCtx, walletCancel := context.WithTimeout(ctx, 3*time.Second)
+		defer walletCancel()
+
+		wallets, err := wt.GetWallets(walletCtx)
+		if err != nil {
+			wt.logger.Error().Err(err).Msg("failed to get wallets during shutdown")
+		} else {
+			// Create a WaitGroup for parallel unsubscribe operations
+			var wg sync.WaitGroup
+			for _, wallet := range wallets {
+				wg.Add(1)
+				go func(address string) {
+					defer wg.Done()
+					if err := wt.wsClient.UnsubscribeFromWallet(ctx, address); err != nil {
+						wt.logger.Error().
+							Err(err).
+							Str("wallet", address).
+							Msg("failed to unsubscribe wallet during shutdown")
+					}
+				}(wallet.Address)
+			}
+
+			// Wait for all unsubscribe operations with timeout
+			unsubDone := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(unsubDone)
+			}()
+
+			select {
+			case <-unsubDone:
+				wt.logger.Info().Msg("all wallets unsubscribed")
+			case <-ctx.Done():
+				wt.logger.Warn().Msg("wallet unsubscribe timed out")
+			}
 		}
+
+		// Close websocket client
+		if wt.wsClient != nil {
+			if err := wt.wsClient.Close(); err != nil {
+				wt.logger.Error().Err(err).Msg("failed to close websocket client")
+			}
+		}
+	}()
+
+	// Close database connection in parallel
+	go func() {
+		defer close(dbDone)
+		if wt.db != nil {
+			wt.db.Close()
+		}
+	}()
+
+	// Wait for all components to shut down or timeout
+	select {
+	case <-wsClientDone:
+		wt.logger.Info().Msg("websocket client shutdown complete")
+	case <-ctx.Done():
+		wt.logger.Error().Msg("websocket client shutdown timed out")
 	}
 
-	// Then close notification service
-	if wt.notifier != nil {
-		wt.notifier.Shutdown(shutdownCtx)
-		wt.logger.Info().Msg("Notifier Service shutdown completed")
+	select {
+	case <-dbDone:
+		wt.logger.Info().Msg("database connection closed")
+	case <-ctx.Done():
+		wt.logger.Error().Msg("database shutdown timed out")
 	}
 
-	// Then close database connection
-	if wt.db != nil {
-		wt.db.Close()
-		wt.logger.Info().Msg("Database connection closed")
-	}
-
-	wt.logger.Info().Msg("Wallet Tracker Shutdown complete")
+	wt.logger.Info().Msg("wallet tracker shutdown complete")
 }
 
 func (wt *WalletTracker) AddWallet(ctx context.Context, address string) error {
@@ -202,37 +261,35 @@ func (wt *WalletTracker) initializeWalletTracking(ctx context.Context) error {
 }
 
 func (wt *WalletTracker) startTrackingWallet(ctx context.Context, address string) error {
-	// Create a child context for this subscription
-	subCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	wt.logger.Info().
 		Str("wallet", address).
 		Msg("Starting to track wallet")
 
-	return wt.wsClient.SubscribeToWallet(subCtx, address, func(txInfo websocket.TransactionInfo) {
-		processCtx, cancel := context.WithTimeout(subCtx, 60*time.Second) // Use parent context
-		defer cancel()
+	return wt.wsClient.SubscribeToWallet(ctx, address, func(txInfo websocket.TransactionInfo) {
+		// Create a new, independent context for transaction processing
+		// This ensures transaction processing isn't affected by the websocket context
+		processCtx := context.Background()
+
+		// Add a timeout specific to transaction processing
+		processCtx, cancel := context.WithTimeout(processCtx, 60*time.Second)
 
 		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					wt.logger.Error().
-						Interface("panic", r).
-						Str("wallet", address).
-						Str("signature", txInfo.Signature).
-						Msg("Recovered from panic in transaction processing")
-				}
-			}()
+			defer cancel() // Clean up the context when done
 
+			// Create a logger specific to this transaction
 			txLogger := wt.logger.With().
 				Str("wallet", address).
 				Str("signature", txInfo.Signature).
+				Str("operation", "transaction_processing").
 				Logger()
 
 			txLogger.Info().Msg("Processing new transaction")
+
 			if err := wt.handleTransaction(processCtx, address, txInfo.Signature); err != nil {
-				txLogger.Error().Err(err).Msg("Transaction handling failed")
+				// Log error with transaction-specific context
+				txLogger.Error().
+					Err(err).
+					Msg("Failed to handle transaction")
 			}
 		}()
 	})
