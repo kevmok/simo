@@ -366,11 +366,20 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 
 			// Run Recv() in a goroutine to prevent blocking
 			go func() {
-				notif, err := sub.Recv(context.Background())
-				recvResult <- struct {
+				// Create a timeout context for the receive operation
+				recvCtx, recvCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer recvCancel()
+
+				notif, err := sub.Recv(recvCtx)
+				select {
+				case recvResult <- struct {
 					notification *ws.LogResult
 					err          error
-				}{notif, err}
+				}{notif, err}:
+				default:
+					// If the channel is blocked, log the error and return
+					c.logger.Warn().Msg("Failed to send receive result, channel might be blocked")
+				}
 			}()
 
 			// Wait for either shutdown signal or receive result
