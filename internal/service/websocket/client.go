@@ -513,13 +513,40 @@ func (c *WSClient) UnsubscribeFromWallet(ctx context.Context, address string) er
 		return fmt.Errorf("no subscription found for address: %s", address)
 	}
 
-	// Mark subscription for deletion before unlocking
+	// Store the subscription locally and remove from map
+	subscription := sub.sub
 	delete(c.subscriptions, address)
 	c.subscriptionsMu.Unlock()
 
-	// Unsubscribe after removing from map to prevent reconnection attempts
-	if sub != nil && sub.sub != nil {
-		sub.sub.Unsubscribe()
+	// Clean up subscription status
+	c.statusMu.Lock()
+	delete(c.subscriptionStatus, address)
+	c.statusMu.Unlock()
+
+	// Unsubscribe after removing from maps
+	if subscription != nil {
+		// Use a context with timeout for unsubscribe operation
+		unsubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		// Perform unsubscribe in a separate goroutine to handle potential blocking
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			subscription.Unsubscribe()
+		}()
+
+		// Wait for unsubscribe to complete or timeout
+		select {
+		case <-done:
+			c.logger.Debug().
+				Str("wallet", address).
+				Msg("Successfully unsubscribed wallet")
+		case <-unsubCtx.Done():
+			c.logger.Warn().
+				Str("wallet", address).
+				Msg("Unsubscribe operation timed out")
+		}
 	}
 
 	return nil
