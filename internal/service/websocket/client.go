@@ -61,6 +61,7 @@ type Subscription struct {
 	callback   func(TransactionInfo)
 	sub        *ws.LogSubscription
 	commitment rpc.CommitmentType
+	cancel     context.CancelFunc
 }
 
 func DefaultConfig() Config {
@@ -169,8 +170,12 @@ func (c *WSClient) SubscribeToWallet(addr string, callback func(TransactionInfo)
 		return fmt.Errorf("invalid address: %w", err)
 	}
 
+	// Create subscription context with cancellation
+	subCtx, cancel := context.WithCancel(c.ctx)
+
 	sub, err := c.client.LogsSubscribeMentions(pubKey, rpc.CommitmentConfirmed)
 	if err != nil {
+		cancel()
 		return fmt.Errorf("subscription failed: %w", err)
 	}
 
@@ -179,6 +184,7 @@ func (c *WSClient) SubscribeToWallet(addr string, callback func(TransactionInfo)
 		callback:   callback,
 		sub:        sub,
 		commitment: rpc.CommitmentConfirmed,
+		cancel:     cancel,
 	}
 	c.subsMu.Unlock()
 
@@ -187,13 +193,13 @@ func (c *WSClient) SubscribeToWallet(addr string, callback func(TransactionInfo)
 	})
 
 	c.group.Go(func() error {
-		return c.handleSubscription(addr, sub)
+		return c.handleSubscription(subCtx, addr, sub)
 	})
 
 	return nil
 }
 
-func (c *WSClient) handleSubscription(addr string, sub *ws.LogSubscription) error {
+func (c *WSClient) handleSubscription(ctx context.Context, addr string, sub *ws.LogSubscription) error {
 	defer func() {
 		c.subsMu.Lock()
 		delete(c.subscriptions, addr)
@@ -206,12 +212,12 @@ func (c *WSClient) handleSubscription(addr string, sub *ws.LogSubscription) erro
 
 	for {
 		select {
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			return nil
 		default:
-			notif, err := sub.Recv(c.ctx)
+			notif, err := sub.Recv(ctx)
 			if err != nil {
-				if c.ctx.Err() != nil {
+				if ctx.Err() != nil {
 					return nil
 				}
 				c.handleSubscriptionError(addr, err)
@@ -350,6 +356,11 @@ func (c *WSClient) UnsubscribeFromWallet(addr string) error {
 		return fmt.Errorf("subscription not found")
 	}
 
+	// Cancel the subscription context first
+	if sub.cancel != nil {
+		sub.cancel()
+	}
+
 	if sub.sub != nil {
 		sub.sub.Unsubscribe()
 	}
@@ -358,6 +369,10 @@ func (c *WSClient) UnsubscribeFromWallet(addr string) error {
 	c.statusMu.Lock()
 	delete(c.status, addr)
 	c.statusMu.Unlock()
+
+	c.logger.Debug().
+		Str("address", addr).
+		Msg("Successfully unsubscribed wallet")
 
 	return nil
 }
