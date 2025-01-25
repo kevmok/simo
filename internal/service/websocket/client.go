@@ -364,12 +364,12 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 				err          error
 			}, 1)
 
-			// Run Recv() in a goroutine to prevent blocking
-			go func() {
-				// Create a timeout context for the receive operation with increased duration
-				recvCtx, recvCancel := context.WithTimeout(context.Background(), 60*time.Second)
-				defer recvCancel()
+			// Create a timeout context for the receive operation
+			recvCtx, recvCancel := context.WithTimeout(context.Background(), 120*time.Second)
 
+			// Run the receive operation in a goroutine
+			go func() {
+				defer recvCancel() // Clean up the context when done
 				notif, err := sub.Recv(recvCtx)
 				select {
 				case recvResult <- struct {
@@ -377,20 +377,17 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 					err          error
 				}{notif, err}:
 				case <-recvCtx.Done():
-					// Handle context timeout specifically
 					c.logger.Warn().
 						Str("address", address).
-						Msg("Receive operation timed out, will retry")
-					return
-				default:
-					// If the channel is blocked, log the error and return
-					c.logger.Warn().Msg("Failed to send receive result, channel might be blocked")
+						Dur("timeout", 120*time.Second).
+						Msg("Receive operation timed out, will retry with backoff")
 				}
 			}()
 
 			// Wait for either shutdown signal or receive result
 			select {
 			case <-c.done:
+				recvCancel() // Cancel the receive operation on shutdown
 				c.logger.Debug().
 					Str("address", address).
 					Msg("Subscription handler exiting due to shutdown")
