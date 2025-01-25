@@ -377,6 +377,11 @@ func (c *WSClient) handleSubscription(address string, sub *ws.LogSubscription) {
 					err          error
 				}{notif, err}:
 				case <-recvCtx.Done():
+					// Send the timeout error to the main loop for proper error handling
+					recvResult <- struct {
+						notification *ws.LogResult
+						err          error
+					}{nil, recvCtx.Err()}
 					c.logger.Warn().
 						Str("address", address).
 						Dur("timeout", 120*time.Second).
@@ -415,11 +420,13 @@ func (c *WSClient) handleSubscriptionError(address string, err error, consecutiv
 		Err(err).
 		Str("wallet", address).
 		Int("consecutive_errors", *consecutiveErrors+1).
+		Dur("current_backoff", *errorBackoff).
 		Msg("Error receiving log notification")
 
 	// Update status with error
 	c.updateSubscriptionStatus(address, func(status *SubscriptionStatus) {
 		status.ErrorCount++
+		status.LastActivity = time.Now()
 	})
 
 	// Check if subscription still exists
@@ -435,7 +442,7 @@ func (c *WSClient) handleSubscriptionError(address string, err error, consecutiv
 	}
 
 	*consecutiveErrors++
-	const maxConsecutiveErrors = 3
+	const maxConsecutiveErrors = 5 // Increased from 3 to give more retry attempts
 
 	// Handle reconnection after max errors
 	if *consecutiveErrors >= maxConsecutiveErrors {
@@ -452,14 +459,27 @@ func (c *WSClient) handleSubscriptionError(address string, err error, consecutiv
 			c.logger.Error().
 				Err(err).
 				Msg("Failed to reconnect")
+			// Reset consecutive errors to allow more retries before next reconnect attempt
+			*consecutiveErrors = maxConsecutiveErrors - 2
 			return
 		}
 		return
 	}
 
-	// Exponential backoff with jitter
-	sleepDuration := *errorBackoff + time.Duration(rand.Int63n(int64(*errorBackoff/2)))
+	// Calculate backoff duration with jitter
+	baseBackoff := *errorBackoff
+	jitterRange := int64(baseBackoff / 2)
+	jitter := time.Duration(rand.Int63n(jitterRange))
+	sleepDuration := baseBackoff + jitter
+
+	c.logger.Info().
+		Str("wallet", address).
+		Dur("backoff_duration", sleepDuration).
+		Msg("Applying backoff before retry")
+
 	time.Sleep(sleepDuration)
+
+	// Increase backoff for next attempt
 	*errorBackoff = time.Duration(float64(*errorBackoff) * 1.5)
 	if *errorBackoff > 30*time.Second {
 		*errorBackoff = 30 * time.Second
