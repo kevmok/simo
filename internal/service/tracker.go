@@ -130,7 +130,7 @@ func (wt *WalletTracker) Close() {
 				wg.Add(1)
 				go func(address string) {
 					defer wg.Done()
-					if err := wt.wsClient.UnsubscribeFromWallet(ctx, address); err != nil {
+					if err := wt.wsClient.UnsubscribeFromWallet(address); err != nil {
 						wt.logger.Error().
 							Err(err).
 							Str("wallet", address).
@@ -202,7 +202,7 @@ func (wt *WalletTracker) AddWallet(ctx context.Context, address string) error {
 
 func (wt *WalletTracker) RemoveWallet(ctx context.Context, address string) error {
 	// First stop tracking the wallet
-	if err := wt.wsClient.UnsubscribeFromWallet(ctx, address); err != nil {
+	if err := wt.wsClient.UnsubscribeFromWallet(address); err != nil {
 		return fmt.Errorf("failed to unsubscribe from wallet: %w", err)
 	}
 
@@ -265,7 +265,7 @@ func (wt *WalletTracker) startTrackingWallet(ctx context.Context, address string
 		Str("wallet", address).
 		Msg("Starting to track wallet")
 
-	return wt.wsClient.SubscribeToWallet(ctx, address, func(txInfo websocket.TransactionInfo) {
+	return wt.wsClient.SubscribeToWallet(address, func(txInfo websocket.TransactionInfo) {
 		// Create a new, independent context for transaction processing
 		// This ensures transaction processing isn't affected by the websocket context
 		processCtx := context.Background()
