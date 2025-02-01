@@ -127,6 +127,7 @@ func (h *Handler) RemoveWallet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.tracker.RemoveWallet(r.Context(), address); err != nil {
+		h.logger.Error().Err(err).Str("address", address).Msg("Failed to remove wallet")
 		h.respondWithError(w, http.StatusInternalServerError, err)
 		return
 	}
