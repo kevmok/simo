@@ -61,6 +61,7 @@ type Subscription struct {
 	callback   func(TransactionInfo)
 	sub        *ws.LogSubscription
 	commitment rpc.CommitmentType
+	ctx        context.Context
 	cancel     context.CancelFunc
 }
 
@@ -184,6 +185,7 @@ func (c *WSClient) SubscribeToWallet(addr string, callback func(TransactionInfo)
 		callback:   callback,
 		sub:        sub,
 		commitment: rpc.CommitmentConfirmed,
+		ctx:        subCtx,
 		cancel:     cancel,
 	}
 	c.subsMu.Unlock()
@@ -312,7 +314,8 @@ func (c *WSClient) triggerReconnect() {
 
 	go func() {
 		backoff := c.config.ReconnectInterval
-		for i := 0; i < c.config.MaxReconnectAttempts; i++ {
+		attempts := 0
+		for attempts < c.config.MaxReconnectAttempts {
 			select {
 			case <-c.ctx.Done():
 				return
@@ -320,10 +323,14 @@ func (c *WSClient) triggerReconnect() {
 				if err := c.Connect(); err == nil {
 					if err := c.resubscribeAll(); err == nil {
 						c.logger.Info().Msg("Reconnected successfully")
+						c.connStatusMu.Lock()
+						c.connStatus.ReconnectCount = 0
+						c.connStatusMu.Unlock()
 						return
 					}
 				}
 				backoff = time.Duration(float64(backoff) * 1.5)
+				attempts++
 			}
 		}
 		c.logger.Error().Msg("Failed to reconnect after maximum attempts")
@@ -335,14 +342,31 @@ func (c *WSClient) resubscribeAll() error {
 	defer c.subsMu.RUnlock()
 
 	for addr, sub := range c.subscriptions {
+		sub.cancel()
+
+		subCtx, cancel := context.WithCancel(c.ctx)
+
 		newSub, err := c.client.LogsSubscribeMentions(
 			solana.MustPublicKeyFromBase58(addr),
 			sub.commitment,
 		)
 		if err != nil {
+			cancel()
 			return fmt.Errorf("failed to resubscribe %s: %w", addr, err)
 		}
+
 		sub.sub = newSub
+		sub.ctx = subCtx
+		sub.cancel = cancel
+
+		c.group.Go(func() error {
+			return c.handleSubscription(subCtx, addr, newSub)
+		})
+
+		c.updateSubscriptionStatus(addr, func(s *SubscriptionStatus) {
+			s.IsActive = true
+			s.IsReconnecting = false
+		})
 	}
 	return nil
 }
